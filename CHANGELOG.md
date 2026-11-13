@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.47 — 2026-11-13
+
+- Register an official OMP `UsageProvider` on `antigravity-acp` (`extension/usage-report.ts`) so native `/usage show` (and `omp usage`) displays live Antigravity quota pools, remaining percentages, and reset timers on demand without persistent widgets or reverse proxies.
+- Prepare the signed Managed ACP runtime on demand during quota lookups (`prepareManagedAcpForQuota` in `extension/acp-runtime-source.ts`) by temporarily masking the adapter-generated `agy-acp-cli.sh` wrapper only for the synchronous launch check before restoring it, so CLI-first setups (`agy 1.5.8`) can query official ACP `/usage` seamlessly while keeping inference on the newer CLI.
+
 ## 0.1.46 — 2026-11-13
 
 - Report per-turn token usage and API cost estimates from local Antigravity conversation SQLite (`extension/usage-db.ts`, supporting both `bun:sqlite` in OMP and `node:sqlite` in tests) when ACP `/usage` is unavailable or disabled, keeping `OMP_ACP_USAGE=off` as an explicit opt-out.
