@@ -97,6 +97,7 @@ omp plugin uninstall @n1netynine99/omp-antigravity-acp-provider
 | Symptom | Check |
 | --- | --- |
 | `omp: command not found` | This is an OMP plugin. Install OMP first; there is no standalone CLI. |
+| Google sign-in is requested on every start | The ACP server refreshes its one-hour access token with the saved refresh token at process start. That refresh is cancelled if the process is killed right away, so keep outbound HTTPS to `oauth2.googleapis.com` reachable (a proxy must be exported as `HTTPS_PROXY` for OMP, not only set in the desktop environment). `/antigravity-acp account` shows the stored login; a successful server start logs `keyringAuth: loaded token` and no `token refresh failed` line. |
 | No models after `/antigravity-acp refresh` | Run `/antigravity-acp account` to confirm both sides are signed in, then retry with internet access. ACP can advertise fewer models than the Antigravity app. |
 | Two Antigravity providers appear | Remove the older adapter (`antigravity-acp-omp`, the upstream Pi extension, or a duplicate npm install), then restart OMP. |
 | Login opens the wrong Google account | Both login paths always start a fresh sign-in. Choose the intended account (or "Use another account") on Google's consent screen. |

@@ -28,3 +28,11 @@ test("built runtime passes the full-context estimate to the final usage projecti
   assert.match(text, /usageFromPrompt2\(response, binding\.ompFallbackContextTokens\)/,
     "the final response must receive the full OMP context estimate");
 });
+
+test("built quota probe waits for /usage and spares an in-flight OAuth refresh", { skip: !built }, () => {
+  const text = fs.readFileSync(bundle, "utf8");
+  assert.match(text, /waitForUsageCommand\(sessionId, (?:20000|2e4), signal\)/,
+    "an expired-token refresh started at boot must not be cut off by the old 5 s probe");
+  assert.match(text, /setTimeout\(resolve, (?:1500|1\.5e3)\)/,
+    "closing the probe process must wait a grace period so its token refresh can finish");
+});
