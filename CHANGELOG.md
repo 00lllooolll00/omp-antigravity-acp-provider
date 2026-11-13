@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.49 — 2026-11-13
+
+- Stop cancelling the ACP server's OAuth token refresh. The quota probe used to wait only 5 s for `/usage` and then kill the child, which aborted the refresh the server had just started, marked the saved token invalid, and left the next launch asking for a browser sign-in. The probe now waits 20 s and gives a 1.5 s grace before tearing the process down, so an expired access token can be renewed with the stored refresh token instead of forcing a new login.
+- Document the repeated-sign-in cause in the README: the one-hour access token is refreshed at process start, so `oauth2.googleapis.com` must be reachable, and a proxy has to be exported to OMP rather than only configured in the desktop session.
+- Add a built-runtime regression that asserts the longer `/usage` wait and the pre-close grace stay in the generated bundle.
+
 ## 0.1.48 — 2026-11-13
 
 - Publish a standby connection only after `initialize` completes and the launch inputs (`cwd`, native-tool policy, permission profile, runtime source) still match, so a prompt arriving mid-warmup can no longer consume a half-initialized connection or make the warmup coroutine call `discardSession` on a live session.
