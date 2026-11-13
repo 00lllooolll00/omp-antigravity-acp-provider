@@ -1,12 +1,12 @@
 # omp-antigravity-acp-provider
 
-[![npm version](https://img.shields.io/npm/v/omp-antigravity-acp-provider.svg)](https://www.npmjs.com/package/omp-antigravity-acp-provider)
-[![npm downloads](https://img.shields.io/npm/dm/omp-antigravity-acp-provider.svg)](https://www.npmjs.com/package/omp-antigravity-acp-provider)
+[![npm version](https://img.shields.io/npm/v/@00lllooolll00%2Fomp-antigravity-acp-provider.svg)](https://www.npmjs.com/package/@00lllooolll00/omp-antigravity-acp-provider)
+[![npm downloads](https://img.shields.io/npm/dm/@00lllooolll00%2Fomp-antigravity-acp-provider.svg)](https://www.npmjs.com/package/@00lllooolll00/omp-antigravity-acp-provider)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.19-339933?logo=node.js&logoColor=white)](package.json)
-[![OMP marketplace](https://img.shields.io/badge/OMP-marketplace-7c3aed)](https://github.com/SenCha930511/omp-antigravity-acp-provider)
-[![ACP runtime](https://img.shields.io/badge/ACP%20runtime-%E2%89%A51.4.1-4285F4)](https://github.com/SenCha930511/omp-antigravity-acp-provider)
-[![GitHub stars](https://img.shields.io/github/stars/SenCha930511/omp-antigravity-acp-provider)](https://github.com/SenCha930511/omp-antigravity-acp-provider/stargazers)
+[![OMP marketplace](https://img.shields.io/badge/OMP-marketplace-7c3aed)](https://github.com/00lllooolll00/omp-antigravity-acp-provider)
+[![ACP runtime](https://img.shields.io/badge/ACP%20runtime-%E2%89%A51.4.1-4285F4)](https://github.com/00lllooolll00/omp-antigravity-acp-provider)
+[![GitHub stars](https://img.shields.io/github/stars/00lllooolll00/omp-antigravity-acp-provider)](https://github.com/00lllooolll00/omp-antigravity-acp-provider/stargazers)
 
 Google Antigravity's official ACP server, adapted for **Oh My Pi (OMP)**.
 
@@ -44,14 +44,14 @@ Follow these steps in order. The whole flow takes a few minutes, plus Google's s
 Use the marketplace (this repository is also the **sencha-plugins** marketplace):
 
 ```sh
-omp plugin marketplace add SenCha930511/omp-antigravity-acp-provider
+omp plugin marketplace add 00lllooolll00/omp-antigravity-acp-provider
 omp plugin install omp-antigravity-acp-provider@sencha-plugins
 ```
 
 Or install the published npm package directly:
 
 ```sh
-omp plugin install npm:omp-antigravity-acp-provider
+omp plugin install npm:@00lllooolll00/omp-antigravity-acp-provider
 ```
 
 Do not install both. Remove or disable any older Antigravity ACP adapter first.
