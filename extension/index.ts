@@ -102,9 +102,20 @@ export default async function (pi: OmpHostApi) {
 }
 
 // Explicit state injection keeps command integration tests away from user data.
-export async function registerOmpAdapter(pi: OmpHostApi, stateDir: string,
-  createConnection?: (options: ConstructorParameters<typeof TierConnection>[0]) => TierConnection) {
-  const standbyWarmupEnabled = createConnection === undefined && process.env.OMP_ACP_WARMUP !== "off";
+export interface OmpAdapterOptions {
+  standbyWarmup?: boolean;
+  prepareRuntime?: () => Promise<void>;
+  authReady?: () => Promise<boolean>;
+}
+
+export async function registerOmpAdapter(
+  pi: OmpHostApi,
+  stateDir: string,
+  createConnection?: (options: ConstructorParameters<typeof TierConnection>[0]) => TierConnection,
+  adapterOptions?: OmpAdapterOptions,
+) {
+  const standbyWarmupEnabled = (adapterOptions?.standbyWarmup ?? createConnection === undefined)
+    && process.env.OMP_ACP_WARMUP !== "off";
   const makeConnection = createConnection ?? ((options: ConstructorParameters<typeof TierConnection>[0]): TierConnection => new TierConnection(options));
   const configPath = path.join(stateDir, "config.json");
   const cachePath = path.join(stateDir, "models-cache.json");
@@ -142,7 +153,16 @@ export async function registerOmpAdapter(pi: OmpHostApi, stateDir: string,
   let runtimePreference: Promise<AcpRuntimePreference | undefined> | undefined;
   let selectedRuntimePreference: AcpRuntimePreference | undefined;
   const currentPermissionProfile = () => resolveAcpPermissionProfile(selectedRuntimePreference, permissionMode);
+  const currentRuntimeKey = () => `${selectedRuntimePreference?.source ?? ""}:${selectedRuntimePreference?.cliPath ?? ""}`;
+  const checkAuthReady = adapterOptions?.authReady ?? authReady;
   function prepareRuntime() {
+    if (adapterOptions?.prepareRuntime) {
+      readiness ??= adapterOptions.prepareRuntime().catch((error: unknown) => {
+        readiness = undefined;
+        throw error;
+      });
+      return readiness;
+    }
     runtimePreference ??= preferNewestAcpRuntime(stateDir).then(preference => {
       selectedRuntimePreference = preference;
       return preference;
@@ -206,7 +226,7 @@ export async function registerOmpAdapter(pi: OmpHostApi, stateDir: string,
   // interactive Google consent flow at session/new. A missing local login is a
   // user action, not a reason to leave the submitted message pending.
   async function requireAcpAuth(): Promise<void> {
-    if (await authReady()) return;
+    if (await checkAuthReady()) return;
     throw new Error("Antigravity ACP is not signed in. Run /login (or /antigravity-acp login) before sending a message.");
   }
 
@@ -216,14 +236,19 @@ export async function registerOmpAdapter(pi: OmpHostApi, stateDir: string,
     cwd: string;
     autoApproveProcess: boolean;
     nativeTools: typeof toolPolicy.nativeTools;
+    runtimeKey: string;
     controller: AbortController;
     consumed: boolean;
   }
   let shuttingDown = false;
   let standby: StandbyConnection | undefined;
   let warmupInFlight: Promise<void> | undefined;
+  let warmupController: AbortController | undefined;
+  let warmupGeneration = 0;
 
   async function closeStandby(): Promise<void> {
+    warmupGeneration++;
+    warmupController?.abort();
     const current = standby;
     standby = undefined;
     if (current && !current.consumed) {
@@ -237,15 +262,20 @@ export async function registerOmpAdapter(pi: OmpHostApi, stateDir: string,
   // valid local auth, so non-Antigravity OMP sessions pay zero process cost.
   function scheduleWarmup(modelProvider?: string): void {
     if (!standbyWarmupEnabled || shuttingDown || modelProvider !== "antigravity-acp" || standby || warmupInFlight) return;
+    const generation = warmupGeneration;
+    const controller = new AbortController();
+    warmupController = controller;
+    let warmupConnection: TierConnection | undefined;
+    let published = false;
     warmupInFlight = (async () => {
       try {
-        if (!(await authReady()) || shuttingDown) return;
+        if (!(await checkAuthReady()) || shuttingDown || controller.signal.aborted || generation !== warmupGeneration) return;
         await diagnostics.measure("runtime.prepare", prepareRuntime);
-        if (shuttingDown || standby) return;
+        if (shuttingDown || controller.signal.aborted || generation !== warmupGeneration || standby) return;
         const cwd = process.cwd();
         const profile = currentPermissionProfile();
         const nativeTools = toolPolicy.nativeTools;
-        const controller = new AbortController();
+        const runtimeKey = currentRuntimeKey();
         const connection = spawnConnection({
           cwd,
           ompNativeTools: nativeTools,
@@ -254,31 +284,43 @@ export async function registerOmpAdapter(pi: OmpHostApi, stateDir: string,
           ompCleanup: cleanup,
           ompDiagnostics: diagnostics,
         });
+        warmupConnection = connection;
+        await diagnostics.measure("warmup.initialize", () => connection.initialize(controller.signal));
+        if (
+          shuttingDown
+          || controller.signal.aborted
+          || generation !== warmupGeneration
+          || standby
+          || !connection.process.alive
+          || cwd !== process.cwd()
+          || nativeTools !== toolPolicy.nativeTools
+          || profile.autoApproveProcess !== currentPermissionProfile().autoApproveProcess
+          || runtimeKey !== currentRuntimeKey()
+        ) {
+          return;
+        }
         const entry: StandbyConnection = {
           connection,
           cwd,
           autoApproveProcess: profile.autoApproveProcess,
           nativeTools,
+          runtimeKey,
           controller,
           consumed: false,
         };
         standby = entry;
+        published = true;
         void connection.process.exited.finally(() => {
           if (standby === entry && !entry.consumed) standby = undefined;
         });
-        try {
-          await connection.initialize(controller.signal);
-          if (shuttingDown || controller.signal.aborted || entry.consumed) return;
-          const warmed = await connection.newSession(cwd, controller.signal);
-          await connection.discardSession(warmed.sessionId).catch(() => {});
-        } catch {
-          if (standby === entry && !entry.consumed) {
-            standby = undefined;
-            await connection.close().catch(() => {});
-          }
-        }
       } catch {
+        diagnostics.record("warmup.error", 0);
         // Warmup is strictly advisory; cold-start fallback runs on first prompt.
+      } finally {
+        if (!published && warmupConnection) {
+          await warmupConnection.close().catch(() => {});
+        }
+        if (warmupController === controller) warmupController = undefined;
       }
     })().finally(() => { warmupInFlight = undefined; });
   }
@@ -300,23 +342,47 @@ export async function registerOmpAdapter(pi: OmpHostApi, stateDir: string,
     audit: ToolAuditSummary;
   } | undefined;
 
+  function hasCustomLaunchOverrides(options: ConstructorParameters<typeof TierConnection>[0]): boolean {
+    return options.command !== undefined
+      || options.entryPath !== undefined
+      || options.args !== undefined
+      || options.env !== undefined
+      || options.credentialStorage !== undefined
+      || options.initializeTimeoutMs !== undefined
+      || options.operationTimeoutMs !== undefined
+      || options.promptIdleTimeoutMs !== undefined
+      || options.promptWorkIdleTimeoutMs !== undefined
+      || options.maxFrameBytes !== undefined
+      || options.ompSteerMode !== undefined
+      || options.ompSteerTimings !== undefined
+      || options.ompAcpDirectory !== undefined;
+  }
+
   function spawnConnection(options: ConstructorParameters<typeof TierConnection>[0]): TierConnection {
     const profile = currentPermissionProfile();
-    if (standbyWarmupEnabled && !shuttingDown && standby && !standby.consumed
-      && options.ompPurpose !== "quota" && options.handlers !== undefined) {
-      if (standby.cwd === options.cwd
-        && standby.autoApproveProcess === profile.autoApproveProcess
-        && standby.nativeTools === options.ompNativeTools
-        && standby.connection.process.alive) {
-        const entry = standby;
-        standby = undefined;
-        entry.consumed = true;
-        entry.connection.debugToolUpdates = Boolean(options.ompDebugToolUpdates);
-        entry.connection.configureUsage(options.ompUsageMode ?? DEFAULT_USAGE_MODE);
-        entry.connection.rebindHandlers(options.handlers);
-        return entry.connection;
+    if (standbyWarmupEnabled && !shuttingDown && options.ompPurpose !== "quota" && options.handlers !== undefined) {
+      if (standby && !standby.consumed) {
+        if (!hasCustomLaunchOverrides(options)
+          && standby.cwd === options.cwd
+          && standby.autoApproveProcess === profile.autoApproveProcess
+          && standby.nativeTools === options.ompNativeTools
+          && standby.runtimeKey === currentRuntimeKey()
+          && standby.connection.process.alive) {
+          const entry = standby;
+          standby = undefined;
+          entry.consumed = true;
+          entry.connection.debugToolUpdates = Boolean(options.ompDebugToolUpdates);
+          entry.connection.configureUsage(options.ompUsageMode ?? DEFAULT_USAGE_MODE);
+          entry.connection.rebindHandlers(options.handlers);
+          diagnostics.record("warmup.hit", 0);
+          return entry.connection;
+        }
+        diagnostics.record("warmup.evict", 0);
+        void closeStandby();
+      } else {
+        diagnostics.record("warmup.miss", 0);
+        if (warmupInFlight) void closeStandby();
       }
-      void closeStandby();
     }
     const env = {
       ...process.env,
@@ -512,10 +578,15 @@ export async function registerOmpAdapter(pi: OmpHostApi, stateDir: string,
       setContextSettings: next => { contextSettings = next; },
       getToolPolicy: () => toolPolicy,
       setToolPolicy: next => {
-        if (next.nativeTools !== toolPolicy.nativeTools) void closeStandby();
+        const changed = next.nativeTools !== toolPolicy.nativeTools;
         toolPolicy = next;
+        if (changed) void closeStandby();
       },
-      setPermissionModeState: mode => { permissionMode = mode; },
+      setPermissionModeState: mode => {
+        const changed = mode !== permissionMode;
+        permissionMode = mode;
+        if (changed) void closeStandby();
+      },
       getLastToolAudit: () => lastToolAudit,
       getRuntimeForSession: sessionId => runtimes.get(sessionId),
       acquireRuntimeForSession: sessionId => runtimes.acquire(sessionId),
