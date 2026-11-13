@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.48 — 2026-11-13
+
+- Publish a standby connection only after `initialize` completes and the launch inputs (`cwd`, native-tool policy, permission profile, runtime source) still match, so a prompt arriving mid-warmup can no longer consume a half-initialized connection or make the warmup coroutine call `discardSession` on a live session.
+- Abort and await an in-flight warmup from `closeStandby()` through a warmup generation counter and controller, and cancel a superseded background warmup when the first prompt falls back to a cold start, so no idle ACP process is left behind.
+- Warm up with `initialize` alone instead of creating and immediately discarding a throwaway ACP session, which previously skipped `authenticate` and could fail or waste a server-side session on strict runtimes.
+- Reject standby reuse when the caller passes custom launch overrides (`command`, `entryPath`, `args`, `env`, timeouts, frame limits, steer settings, ACP directory), and invalidate standby after tool-policy or permission-mode changes; record `warmup.initialize`, `warmup.hit`, `warmup.miss`, `warmup.evict` and `warmup.error` diagnostics.
+- Add `OmpAdapterOptions` (`standbyWarmup`, `prepareRuntime`, `authReady`) so warmup paths stay testable, with offline coverage for reuse, the mid-initialize race, quota isolation, shutdown abort and policy invalidation. Existing three-argument registrations keep their behavior.
+
 ## 0.1.47 — 2026-11-13
 
 - Register an official OMP `UsageProvider` on `antigravity-acp` (`extension/usage-report.ts`) so native `/usage show` (and `omp usage`) displays live Antigravity quota pools, remaining percentages, and reset timers on demand without persistent widgets or reverse proxies.
