@@ -41,17 +41,17 @@ Follow these steps in order. The whole flow takes a few minutes, plus Google's s
 
 ### 2. Install exactly one adapter
 
-Use the marketplace (this repository is also the **sencha-plugins** marketplace):
+Install the published npm package directly:
+
+```sh
+omp plugin install @n1netynine99/omp-antigravity-acp-provider
+```
+
+Or use the marketplace (this repository is also the **sencha-plugins** marketplace):
 
 ```sh
 omp plugin marketplace add 00lllooolll00/omp-antigravity-acp-provider
 omp plugin install omp-antigravity-acp-provider@sencha-plugins
-```
-
-Or install the published npm package directly:
-
-```sh
-omp plugin install npm:@n1netynine99/omp-antigravity-acp-provider
 ```
 
 Do not install both. Remove or disable any older Antigravity ACP adapter first.
@@ -82,6 +82,15 @@ On Linux the `agy` CLI stores the OAuth token in the Secret Service keyring (`se
 ```
 
 This shows the runtime, native-tool mode and usage state. Send a short prompt to confirm inference.
+
+### Upgrade and uninstall
+
+Upgrade or uninstall the npm-installed plugin:
+
+```sh
+omp plugin upgrade @n1netynine99/omp-antigravity-acp-provider
+omp plugin uninstall @n1netynine99/omp-antigravity-acp-provider
+```
 
 ### Troubleshooting
 
