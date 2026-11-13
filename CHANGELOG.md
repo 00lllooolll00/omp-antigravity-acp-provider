@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.46 — 2026-11-13
+
+- Report per-turn token usage and API cost estimates from local Antigravity conversation SQLite (`extension/usage-db.ts`, supporting both `bun:sqlite` in OMP and `node:sqlite` in tests) when ACP `/usage` is unavailable or disabled, keeping `OMP_ACP_USAGE=off` as an explicit opt-out.
+- Cache the `agy` binary `stat` fingerprint (`cliStamp`) in `acp-runtime-source.json` to skip repeated `agy acp --version` subprocess checks when the binary has not changed, and pre-warm a standby ACP `TierConnection` in the background on `session_start` / `model_select` when authenticated (`OMP_ACP_WARMUP=off` to opt out), reusing it via `rebindHandlers()` on the first inference turn.
+- Add `gemini-4-hydrogen-xhigh` to `offlineFallbackModels()` and defer locking `upstreamModels` until live discovery completes, so offline or uncached sessions expose all Hydrogen reasoning tiers before the first ACP query.
+
 ## 0.1.45 — 2026-11-13
 
 - Keep a fresh Google login from being cancelled by OMP's stale marker removal. The credential watcher now suppresses the follow-up logout while `beginFreshGoogleLogin()` runs, so the new ACP runtime is not closed mid-sign-in with `ACP connection closed`.
