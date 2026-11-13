@@ -1,12 +1,15 @@
 // Compatibility seam for vendored pi-antigravity-acp-provider 0.1.15 / ACP server 1.4.x.
 // OMP effort -> vendored advertised legacy ID -> official model/thought selectors.
-import { AntigravityAcpConnection } from "./vendor/pi-antigravity-acp-provider/src/acp/connection.ts";
+import { existsSync } from "node:fs";
+import { AntigravityAcpConnection, type AntigravityConnectionHandlers } from "./vendor/pi-antigravity-acp-provider/src/acp/connection.ts";
+import { resolveAntigravityAcpDirectory } from "./vendor/pi-antigravity-acp-provider/src/acp/antigravity.ts";
 import { choices, resolveSelection, selector } from "./selectors.ts";
 import { installSessionRouting, normalizeInitializeResponse, type NativeToolMode } from "./tool-routing.ts";
 import { showAcpUpdate } from "./activity-presentation.ts";
 import { alignContextTokens, applyCompactionChunk, applyCompactionUpdate, isTerminalCompaction, type AcpCompactionNotice, type AcpCompactionRecord } from "./acp-compaction.ts";
 import { AgentNoticeFilter } from "./agent-notices.ts";
 import { parseSessionUsage, usageDelta, type SessionUsage } from "./usage-accounting.ts";
+import { conversationDbPath, peekMaxModelStepIdx, readModelStepsAfter, type StepUsageBatch } from "./usage-db.ts";
 import { DEFAULT_USAGE_MODE } from "./context-settings.ts";
 import type { SessionCleanup } from "./session-cleanup.ts";
 import type { Diagnostics } from "./diagnostics.ts";
@@ -37,6 +40,7 @@ export class TierConnection extends AntigravityAcpConnection {
   readonly contextUsage = new Map<string, { used: number; size: number }>();
   readonly compactions = new Map<string, Map<string, AcpCompactionRecord>>();
   readonly usageStatus = new Map<string, { source: string; cache: string; error?: string }>();
+  private readonly acpDirectory: string;
   private readonly ompContextWindows = new Map<string, number>();
   private readonly usageBaselines = new Map<string, SessionUsage>();
   private readonly usageCaptures = new Map<string, { text: string }>();
@@ -58,13 +62,14 @@ export class TierConnection extends AntigravityAcpConnection {
   private readonly steerActivity = new Map<string, Set<() => void>>();
   private readonly permissionIdentity = new PermissionIdentityRegistry();
   private readonly permissionTurns = new Map<string, number>();
-  private readonly noticeHandler: UpdateHandler | undefined;
+  private downstreamHandlers: AntigravityConnectionHandlers;
   private readonly noticeClosed = new Set<string>();
 
-  constructor(options: ConstructorParameters<typeof AntigravityAcpConnection>[0] & { ompNativeTools?: NativeToolMode; ompDebugToolUpdates?: boolean; ompUsageMode?: "auto" | "off"; ompSteerMode?: SteerMode; ompSteerTimings?: SteerTimings; ompCleanup?: SessionCleanup; ompDiagnostics?: Diagnostics; ompPurpose?: "quota" }) {
+  constructor(options: ConstructorParameters<typeof AntigravityAcpConnection>[0] & { ompNativeTools?: NativeToolMode; ompDebugToolUpdates?: boolean; ompUsageMode?: "auto" | "off"; ompSteerMode?: SteerMode; ompSteerTimings?: SteerTimings; ompCleanup?: SessionCleanup; ompDiagnostics?: Diagnostics; ompPurpose?: "quota"; ompAcpDirectory?: string }) {
     super(options);
     this.cleanup = options.ompCleanup;
     this.diagnostics = options.ompDiagnostics;
+    this.acpDirectory = options.ompAcpDirectory ?? options.ompCleanup?.acpDir ?? resolveAntigravityAcpDirectory();
     this.cleanup?.start();
     void this.process.exited.then(() => this.releaseCleanupLeases()).catch(() => {});
     const stopUsageWaiters = () => {
@@ -76,12 +81,12 @@ export class TierConnection extends AntigravityAcpConnection {
     this.steerMode = options.ompSteerMode ?? resolveSteerMode();
     this.steerTimings = options.ompSteerTimings ?? resolveSteerTimings();
     this.maxContinuations = continuationLimit();
-    this.noticeHandler = options.handlers?.onUpdate;
-    const permissionHandler = options.handlers?.onPermission;
+    this.downstreamHandlers = options.handlers ?? {};
     this.setHandlers({ ...options.handlers, onPermission: async request => {
       await this.emitHeldNotice(request.sessionId);
       const decision = this.permissionIdentity?.check(request.sessionId, this.permissionTurn(request.sessionId), request);
       if (decision) return decision;
+      const permissionHandler = this.downstreamHandlers.onPermission;
       return permissionHandler ? permissionHandler(request) : { outcome: { outcome: "cancelled" } };
     }, onUpdate: async notification => {
       const update = notification.update as {
@@ -108,7 +113,7 @@ export class TierConnection extends AntigravityAcpConnection {
         this.recordCompaction(notification.sessionId, update);
         // Keep the server-owned summary out of OMP's transcript, but let the
         // runtime mark a binding unsafe when a tool/permission is parked.
-        if (showAcpUpdate(notification, this.debugToolUpdates)) await options.handlers?.onUpdate?.(notification);
+        if (showAcpUpdate(notification, this.debugToolUpdates)) await this.downstreamHandlers.onUpdate?.(notification);
         return;
       }
       const capture = this.usageCaptures.get(notification.sessionId);
@@ -138,7 +143,7 @@ export class TierConnection extends AntigravityAcpConnection {
         for (const listener of [...this.steerActivity.get(notification.sessionId) ?? []]) listener();
         if (STEER_FROZEN_UPDATES.has(update.sessionUpdate ?? "")) return;
       }
-      if (showAcpUpdate(forward, this.debugToolUpdates)) await options.handlers?.onUpdate?.(forward);
+      if (showAcpUpdate(forward, this.debugToolUpdates)) await this.downstreamHandlers.onUpdate?.(forward);
     } });
     if (options.ompNativeTools) {
       this.toolRouting = { nativeTools: options.ompNativeTools, channel: "pending" };
@@ -148,7 +153,11 @@ export class TierConnection extends AntigravityAcpConnection {
     }
   }
 
-  async initialize(signal?: AbortSignal) {
+  rebindHandlers(handlers: AntigravityConnectionHandlers = {}): void {
+    this.downstreamHandlers = handlers;
+  }
+
+  override async initialize(signal?: AbortSignal) {
     return normalizeInitializeResponse(await super.initialize(signal));
   }
 
@@ -318,8 +327,8 @@ export class TierConnection extends AntigravityAcpConnection {
     const synthetic = {
       sessionId,
       update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: held } },
-    } as Parameters<NonNullable<typeof this.noticeHandler>>[0];
-    await this.noticeHandler?.(synthetic);
+    } as Parameters<UpdateHandler>[0];
+    await this.downstreamHandlers.onUpdate?.(synthetic);
   }
   async retireForReplacement(key: string, id: string) {
     await this.retryOwnership();
@@ -421,6 +430,25 @@ export class TierConnection extends AntigravityAcpConnection {
     }
   }
 
+  private async readModelUsageBatch(
+    dbPath: string | undefined,
+    afterIdx: number,
+    signal?: AbortSignal,
+  ): Promise<StepUsageBatch | undefined> {
+    if (!dbPath || !existsSync(dbPath)) return undefined;
+    const immediate = readModelStepsAfter(dbPath, afterIdx);
+    if (immediate) return immediate;
+    // Give SQLite WAL commits a brief window if stdout flushes before step persistence settles.
+    for (const delayMs of [15, 35]) {
+      if (signal?.aborted) return undefined;
+      await new Promise<void>(resolve => setTimeout(resolve, delayMs));
+      if (signal?.aborted) return undefined;
+      const retried = readModelStepsAfter(dbPath, afterIdx);
+      if (retried) return retried;
+    }
+    return undefined;
+  }
+
   private async promptWithContinuations(request: Parameters<AntigravityAcpConnection["prompt"]>[0], signal?: AbortSignal) {
     let response = await super.prompt(request, signal);
     for (let count = 0; count < this.maxContinuations && !signal?.aborted; count++) {
@@ -458,13 +486,16 @@ export class TierConnection extends AntigravityAcpConnection {
     const deferred = signal ? deferredAbortSignal(signal, this.steerTimings, { source: this, sessionId: id }, queueHold) : undefined;
     try { await this.cleanup?.touch(id); } catch { /* Cleanup must not affect inference. */ }
     try {
-      const queryUsage = process.env.OMP_ACP_USAGE !== "off" && this.usageMode !== "off" && this.usageCommands.has(id);
+      const envUsageEnabled = process.env.OMP_ACP_USAGE !== "off";
+      const queryUsage = envUsageEnabled && this.usageMode !== "off" && this.usageCommands.has(id);
       if (queryUsage && !this.usageBaselines.has(id)) {
         try {
           const baseline = await this.readUsage(id, signal);
           if (baseline) this.usageBaselines.set(id, baseline);
         } catch { /* Restore baseline is optional; never count the prior session as this turn. */ }
       }
+      const dbPath = envUsageEnabled && !queryUsage && this.acpDirectory ? conversationDbPath(this.acpDirectory, id) : undefined;
+      const beforeDbIdx = dbPath ? peekMaxModelStepIdx(dbPath) : -1;
       const started = performance.now();
       this.firstOutput?.set(id, started);
       const response = await this.promptWithContinuations(request, deferred?.signal ?? signal);
@@ -483,9 +514,30 @@ export class TierConnection extends AntigravityAcpConnection {
           },
         };
       };
-      if (response.usage || response.stopReason === "cancelled" || process.env.OMP_ACP_USAGE === "off" || this.usageMode === "off" || !this.usageCommands.has(id) || signal?.aborted) {
+      if (response.usage || response.stopReason === "cancelled" || !envUsageEnabled || signal?.aborted) {
         this.usageBaselines.delete(id);
         this.usageStatus.set(id, { source: response.usage ? "ACP response" : "unavailable", cache: "unknown" });
+        return withContext(response);
+      }
+      if (!queryUsage) {
+        const batch = await this.readModelUsageBatch(dbPath, beforeDbIdx, signal);
+        if (batch) {
+          // usageFromPrompt subtracts cachedReadTokens from inputTokens; DB field 2 is uncached input.
+          const usage = {
+            inputTokens: batch.usage.inputTokens + batch.usage.cachedReadTokens,
+            outputTokens: batch.usage.outputTokens,
+            cachedReadTokens: batch.usage.cachedReadTokens,
+            cachedWriteTokens: batch.usage.cachedWriteTokens,
+            thoughtTokens: batch.usage.thoughtTokens,
+            totalTokens: batch.usage.totalTokens,
+          };
+          this.usageStatus.set(id, {
+            source: `local session db (${batch.calls} call${batch.calls === 1 ? "" : "s"})`,
+            cache: "reported",
+          });
+          return withContext({ ...response, usage });
+        }
+        this.usageStatus.set(id, { source: "unavailable", cache: "unknown" });
         return withContext(response);
       }
       try {

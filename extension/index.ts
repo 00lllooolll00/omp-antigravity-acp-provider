@@ -90,6 +90,7 @@ export function offlineFallbackModels(): PublicCatalogModel[] {
       { modelId: "gemini-4-hydrogen-low", name: "Gemini 4 Hydrogen (low)" },
       { modelId: "gemini-4-hydrogen-medium", name: "Gemini 4 Hydrogen (medium)" },
       { modelId: "gemini-4-hydrogen-high", name: "Gemini 4 Hydrogen (high)" },
+      { modelId: "gemini-4-hydrogen-xhigh", name: "Gemini 4 Hydrogen (xhigh)" },
     ]),
   ];
 }
@@ -100,7 +101,9 @@ export default async function (pi: OmpHostApi) {
 
 // Explicit state injection keeps command integration tests away from user data.
 export async function registerOmpAdapter(pi: OmpHostApi, stateDir: string,
-  createConnection = (options: ConstructorParameters<typeof TierConnection>[0]): TierConnection => new TierConnection(options)) {
+  createConnection?: (options: ConstructorParameters<typeof TierConnection>[0]) => TierConnection) {
+  const standbyWarmupEnabled = createConnection === undefined && process.env.OMP_ACP_WARMUP !== "off";
+  const makeConnection = createConnection ?? ((options: ConstructorParameters<typeof TierConnection>[0]): TierConnection => new TierConnection(options));
   const configPath = path.join(stateDir, "config.json");
   const cachePath = path.join(stateDir, "models-cache.json");
   const toolPolicyPath = path.join(stateDir, "omp-tools.json");
@@ -158,6 +161,78 @@ export async function registerOmpAdapter(pi: OmpHostApi, stateDir: string,
   }
 
   const connections = new Set<TierConnection>();
+  interface StandbyConnection {
+    connection: TierConnection;
+    cwd: string;
+    autoApproveProcess: boolean;
+    nativeTools: typeof toolPolicy.nativeTools;
+    controller: AbortController;
+    consumed: boolean;
+  }
+  let shuttingDown = false;
+  let standby: StandbyConnection | undefined;
+  let warmupInFlight: Promise<void> | undefined;
+
+  async function closeStandby(): Promise<void> {
+    const current = standby;
+    standby = undefined;
+    if (current && !current.consumed) {
+      current.controller.abort();
+      await current.connection.close().catch(() => {});
+    }
+    await warmupInFlight?.catch(() => {});
+  }
+
+  // Only warm up when the active session actually uses antigravity-acp and has
+  // valid local auth, so non-Antigravity OMP sessions pay zero process cost.
+  function scheduleWarmup(modelProvider?: string): void {
+    if (!standbyWarmupEnabled || shuttingDown || modelProvider !== "antigravity-acp" || standby || warmupInFlight) return;
+    warmupInFlight = (async () => {
+      try {
+        if (!(await authReady()) || shuttingDown) return;
+        await diagnostics.measure("runtime.prepare", prepareRuntime);
+        if (shuttingDown || standby) return;
+        const cwd = process.cwd();
+        const profile = currentPermissionProfile();
+        const nativeTools = toolPolicy.nativeTools;
+        const controller = new AbortController();
+        const connection = spawnConnection({
+          cwd,
+          ompNativeTools: nativeTools,
+          ompDebugToolUpdates: toolPolicy.debugToolUpdates,
+          ompUsageMode: contextSettings.defaults.usageMode ?? DEFAULT_USAGE_MODE,
+          ompCleanup: cleanup,
+          ompDiagnostics: diagnostics,
+        });
+        const entry: StandbyConnection = {
+          connection,
+          cwd,
+          autoApproveProcess: profile.autoApproveProcess,
+          nativeTools,
+          controller,
+          consumed: false,
+        };
+        standby = entry;
+        void connection.process.exited.finally(() => {
+          if (standby === entry && !entry.consumed) standby = undefined;
+        });
+        try {
+          await connection.initialize(controller.signal);
+          if (shuttingDown || controller.signal.aborted || entry.consumed) return;
+          const warmed = await connection.newSession(cwd, controller.signal);
+          await connection.discardSession(warmed.sessionId).catch(() => {});
+        } catch {
+          if (standby === entry && !entry.consumed) {
+            standby = undefined;
+            await connection.close().catch(() => {});
+          }
+        }
+      } catch {
+        // Warmup is strictly advisory; cold-start fallback runs on first prompt.
+      }
+    })().finally(() => { warmupInFlight = undefined; });
+  }
+
   const idleTimeoutMs = Number(process.env.OMP_ACP_IDLE_TIMEOUT_MS ?? 900_000);
   if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs < 0 || idleTimeoutMs > 2_147_483_647 || (idleTimeoutMs > 0 && idleTimeoutMs < 1000)) {
     throw new Error("OMP_ACP_IDLE_TIMEOUT_MS must be 0 (disabled) or an integer between 1000 and 2147483647");
@@ -177,6 +252,22 @@ export async function registerOmpAdapter(pi: OmpHostApi, stateDir: string,
 
   function spawnConnection(options: ConstructorParameters<typeof TierConnection>[0]): TierConnection {
     const profile = currentPermissionProfile();
+    if (standbyWarmupEnabled && !shuttingDown && standby && !standby.consumed
+      && options.ompPurpose !== "quota" && options.handlers !== undefined) {
+      if (standby.cwd === options.cwd
+        && standby.autoApproveProcess === profile.autoApproveProcess
+        && standby.nativeTools === options.ompNativeTools
+        && standby.connection.process.alive) {
+        const entry = standby;
+        standby = undefined;
+        entry.consumed = true;
+        entry.connection.debugToolUpdates = Boolean(options.ompDebugToolUpdates);
+        entry.connection.configureUsage(options.ompUsageMode ?? DEFAULT_USAGE_MODE);
+        entry.connection.rebindHandlers(options.handlers);
+        return entry.connection;
+      }
+      void closeStandby();
+    }
     const env = {
       ...process.env,
       ...options.env,
@@ -184,7 +275,7 @@ export async function registerOmpAdapter(pi: OmpHostApi, stateDir: string,
     };
     const launch = options.command || options.entryPath ? undefined
       : assertSelectedAcpCliLaunch(stateDir, selectedRuntimePreference, env, options.ompPurpose === "quota" ? "quota" : "inference");
-    return createConnection({ ...options, ...launch, env });
+    return makeConnection({ ...options, ...launch, env });
   }
 
   const lifecycle = new OmpSessionLifecycle(id => runtimes.close(id), async id => {
@@ -218,16 +309,17 @@ export async function registerOmpAdapter(pi: OmpHostApi, stateDir: string,
   }, (bundle, id) => lifecycle.disposeRuntime(id, bundle, () => bundle.runtime.close()),
   { timeoutMs: idleTimeoutMs, maxIdleEntries, canDispose: bundle => !bundle.isBusy() });
 
-  async function closePool() { await lifecycle.closeAll(); await runtimes.closeAll(); }
+  async function closePool() { await closeStandby(); await lifecycle.closeAll(); await runtimes.closeAll(); }
 
   const routing = new TranscriptRouting();
   const sessionIdOf = (ctx: OmpCommandContext | undefined): string | undefined => ctx?.sessionManager?.getSessionId?.();
   pi.on("session_shutdown", async (_event: unknown, ctx: OmpCommandContext) => {
+    shuttingDown = true;
     const failures: unknown[] = [];
     const sessionId = sessionIdOf(ctx);
     if (sessionId) {
       const routingId = routing.forget(sessionId, ctx?.sessionManager?.getSessionFile?.());
-      const closing = [lifecycle.closeSession(sessionId)];
+      const closing = [closeStandby(), lifecycle.closeSession(sessionId)];
       if (routingId !== sessionId) closing.push(lifecycle.closeSession(routingId));
       const results = await Promise.allSettled([...closing, lifecycle.waitClosing(), runtimes.closeIdle()]);
       for (const result of results) if (result.status === "rejected") failures.push(result.reason);
@@ -257,6 +349,7 @@ export async function registerOmpAdapter(pi: OmpHostApi, stateDir: string,
     connections,
     isPoolBusy: () => runtimes.values().some(bundle => bundle.isBusy()),
     logoutAllRuntimes: async () => {
+      await closeStandby();
       await Promise.all(runtimes.values().map(bundle => bundle.runtime.logout()));
       // Finish the Antigravity-side cleanup even when the pool is empty,
       // instead of instantiating a runtime just to log it out.
@@ -282,9 +375,22 @@ export async function registerOmpAdapter(pi: OmpHostApi, stateDir: string,
       }
     }
   };
+  const activeModelProvider = (event: unknown, ctx: OmpCommandContext | undefined): string | undefined => {
+    const fromEvent = event && typeof event === "object"
+      ? (event as { model?: { provider?: unknown } }).model?.provider
+      : undefined;
+    if (typeof fromEvent === "string") return fromEvent;
+    const fromContext = (ctx as (OmpCommandContext & { model?: { provider?: unknown } }) | undefined)?.model?.provider;
+    return typeof fromContext === "string" ? fromContext : undefined;
+  };
   pi.on("session_start", async (event: unknown, ctx: OmpCommandContext) => {
+    shuttingDown = false;
     routing.clearPending();
     auth.watchOmpCredentials(ctx); await trackOmpSource(event, ctx); notifyAcpCompactions(ctx); cleanup.start();
+    scheduleWarmup(activeModelProvider(event, ctx));
+  });
+  pi.on("model_select", (event: unknown, ctx: OmpCommandContext) => {
+    scheduleWarmup(activeModelProvider(event, ctx));
   });
   pi.on("agent_end", async (event: unknown, ctx: OmpCommandContext) => {
     await trackOmpSource(event, ctx);
@@ -354,7 +460,10 @@ export async function registerOmpAdapter(pi: OmpHostApi, stateDir: string,
       getContextSettings: () => contextSettings,
       setContextSettings: next => { contextSettings = next; },
       getToolPolicy: () => toolPolicy,
-      setToolPolicy: next => { toolPolicy = next; },
+      setToolPolicy: next => {
+        if (next.nativeTools !== toolPolicy.nativeTools) void closeStandby();
+        toolPolicy = next;
+      },
       setPermissionModeState: mode => { permissionMode = mode; },
       getLastToolAudit: () => lastToolAudit,
       getRuntimeForSession: sessionId => runtimes.get(sessionId),
@@ -448,7 +557,10 @@ export async function registerOmpAdapter(pi: OmpHostApi, stateDir: string,
               await requireAcpAuth();
               await diagnostics.measure("runtime.prepare", prepareRuntime);
               if (options?.signal?.aborted) throw new Error("ACP request cancelled during startup");
-              if (!catalogStore.upstreamModels.has(model.id)) await catalogStore.refresh(contextSettings);
+              if (!catalogStore.upstreamModels.has(model.id)) {
+                initialModels = await catalogStore.refresh(contextSettings);
+                try { adapted.registerProvider(); } catch { /* advisory */ }
+              }
               const original = catalogStore.upstreamModels.get(model.id);
               if (!original) throw new Error(`Antigravity model was not discovered: ${model.id}. Run /antigravity-acp refresh.`);
               await lifecycle.ready(ticket);

@@ -110,6 +110,7 @@ test("offline fallback exposes Hydrogen and Argon before discovery", () => {
   const byId = new Map(fallback.map(model => [model.id, model]));
   assert.ok(byId.has("gemini-4-hydrogen"), "a fresh install must see Hydrogen without a refresh");
   assert.ok(byId.has("gemini-4-argon"));
-  assert.deepEqual(byId.get("gemini-4-hydrogen")?.thinking?.efforts, ["low", "medium", "high"]);
+  assert.deepEqual(byId.get("gemini-4-hydrogen")?.thinking?.efforts, ["low", "medium", "high", "xhigh"]);
+  assert.equal(selectRuntimeModel(byId.get("gemini-4-hydrogen")!, "xhigh").thinkingLevelMap.high, "gemini-4-hydrogen-xhigh");
   assert.deepEqual(byId.get("gemini-4-argon")?.thinking?.efforts, ["low", "medium", "high"]);
 });

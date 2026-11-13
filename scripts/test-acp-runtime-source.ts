@@ -179,5 +179,31 @@ for (const script of ["exit 1", "echo prerelease"]) {
   assert.equal(env.AGY_ACP_BIN, "/opt/custom-quota-bin");
 }
 
+// Identical agy binary stats reuse the recorded CLI version without re-spawning `agy acp --version`.
+{
+  const stateDir = freshStateDir();
+  const countFile = path.join(stateDir, "probe-count.log");
+  setManagedVersion("1.4.5");
+  stubAgy(`if [ "$1" = "acp" ] && [ "$2" = "--version" ]; then\n  echo 1 >> '${countFile}'\n  echo 2.0.0\n  exit 0\nfi`);
+  const first = await preferNewestAcpRuntime(stateDir, freshEnv(), home);
+  assert.equal(first.source, "cli");
+  assert.equal(first.cliVersion, "2.0.0");
+  assert.ok(first.cliStamp);
+  assert.equal(fs.readFileSync(countFile, "utf8").trim().split("\n").length, 1);
+
+  const second = await preferNewestAcpRuntime(stateDir, freshEnv(), home);
+  assert.equal(second.source, "cli");
+  assert.equal(second.cliVersion, "2.0.0");
+  assert.equal(second.cliStamp, first.cliStamp);
+  assert.equal(fs.readFileSync(countFile, "utf8").trim().split("\n").length, 1);
+
+  stubAgy(`if [ "$1" = "acp" ] && [ "$2" = "--version" ]; then\n  echo 1 >> '${countFile}'\n  echo 2.1.0\n  exit 0\nfi`);
+  const third = await preferNewestAcpRuntime(stateDir, freshEnv(), home);
+  assert.equal(third.source, "cli");
+  assert.equal(third.cliVersion, "2.1.0");
+  assert.notEqual(third.cliStamp, first.cliStamp);
+  assert.equal(fs.readFileSync(countFile, "utf8").trim().split("\n").length, 2);
+}
+
 fs.rmSync(work, { recursive: true, force: true });
 console.log("acp-runtime-source: all selection cases passed");

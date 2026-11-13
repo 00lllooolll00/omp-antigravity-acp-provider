@@ -23,6 +23,7 @@ export interface AcpRuntimePreference {
   source: "env" | "cli" | "managed";
   cliPath?: string;
   cliVersion?: string;
+  cliStamp?: string;
   managedVersion?: string;
 }
 
@@ -95,19 +96,25 @@ export async function preferNewestAcpRuntime(
 ): Promise<AcpRuntimePreference> {
   const wrapper = path.join(stateDir, "agy-acp-cli.sh");
   const configured = env.AGY_ACP_BIN?.trim();
+  const recorded = readRuntimeSourceRecord(stateDir);
   // A wrapper written by this adapter is not a user override. A second
   // extension instance can see the first instance's AGY_ACP_BIN and must
   // recover the CLI profile instead of treating it as an explicit env runtime.
   if (configured && path.resolve(configured) === path.resolve(wrapper)) {
-    const cli = await findAgyCli(env);
+    const cli = await findAgyCli(env, recorded);
     if (cli) {
-      const preference = { source: "cli", cliPath: cli.path, cliVersion: cli.version, managedVersion: readManagedVersion(home) } as const;
+      const preference: AcpRuntimePreference = {
+        source: "cli",
+        cliPath: cli.path,
+        cliVersion: cli.version,
+        ...(cli.stamp ? { cliStamp: cli.stamp } : {}),
+        managedVersion: readManagedVersion(home),
+      };
       writeCliWrapper(wrapper, cli.path);
-      writeRuntimeSourceRecord(stateDir, preference);
+      if (!sameCliRecord(recorded, preference)) writeRuntimeSourceRecord(stateDir, preference);
       env.AGY_ACP_BIN = wrapper;
       return preference;
     }
-    const recorded = readRuntimeSourceRecord(stateDir);
     if (recorded) return recorded;
   } else if (configured) {
     return { source: "env" };
@@ -115,17 +122,31 @@ export async function preferNewestAcpRuntime(
   // The generated wrapper is a POSIX shell script that upstream launches
   // directly; Windows cannot execute it, so it stays managed-only there.
   if (process.platform === "win32") return { source: "managed" };
-  const cli = await findAgyCli(env);
+  const cli = await findAgyCli(env, recorded);
   const managedVersion = readManagedVersion(home);
   if (!cli || (managedVersion && compareVersions(cli.version, managedVersion) <= 0)) {
     if (configured) delete env.AGY_ACP_BIN;
     return { source: "managed", cliPath: cli?.path, cliVersion: cli?.version, managedVersion };
   }
-  const preference = { source: "cli", cliPath: cli.path, cliVersion: cli.version, managedVersion } as const;
+  const preference: AcpRuntimePreference = {
+    source: "cli",
+    cliPath: cli.path,
+    cliVersion: cli.version,
+    ...(cli.stamp ? { cliStamp: cli.stamp } : {}),
+    managedVersion,
+  };
   writeCliWrapper(wrapper, cli.path);
-  writeRuntimeSourceRecord(stateDir, preference);
+  if (!sameCliRecord(recorded, preference)) writeRuntimeSourceRecord(stateDir, preference);
   env.AGY_ACP_BIN = wrapper;
   return preference;
+}
+
+function sameCliRecord(left: AcpRuntimePreference | undefined, right: AcpRuntimePreference): boolean {
+  return left?.source === right.source
+    && left.cliPath === right.cliPath
+    && left.cliVersion === right.cliVersion
+    && left.cliStamp === right.cliStamp
+    && left.managedVersion === right.managedVersion;
 }
 
 function readRuntimeSourceRecord(stateDir: string): AcpRuntimePreference | undefined {
@@ -134,6 +155,7 @@ function readRuntimeSourceRecord(stateDir: string): AcpRuntimePreference | undef
       source?: unknown;
       cliPath?: unknown;
       cliVersion?: unknown;
+      cliStamp?: unknown;
       managedVersion?: unknown;
     };
     if (value.source !== "cli" || typeof value.cliPath !== "string" || typeof value.cliVersion !== "string") return undefined;
@@ -141,6 +163,7 @@ function readRuntimeSourceRecord(stateDir: string): AcpRuntimePreference | undef
       source: "cli",
       cliPath: value.cliPath,
       cliVersion: value.cliVersion,
+      ...(typeof value.cliStamp === "string" ? { cliStamp: value.cliStamp } : {}),
       ...(typeof value.managedVersion === "string" ? { managedVersion: value.managedVersion } : {}),
     };
   } catch {
@@ -148,15 +171,32 @@ function readRuntimeSourceRecord(stateDir: string): AcpRuntimePreference | undef
   }
 }
 
-async function findAgyCli(env: NodeJS.ProcessEnv): Promise<{ path: string; version: string } | undefined> {
+function binaryStamp(file: string): string | undefined {
+  try {
+    const stat = fs.statSync(file);
+    if (!stat.isFile()) return undefined;
+    return `${stat.dev}:${stat.ino}:${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}`;
+  } catch {
+    return undefined;
+  }
+}
+
+async function findAgyCli(
+  env: NodeJS.ProcessEnv,
+  recorded?: AcpRuntimePreference,
+): Promise<{ path: string; version: string; stamp?: string } | undefined> {
   const agy = findExecutableOnPath("agy", env) ?? findExecutableOnPath("agy.exe", env);
   if (!agy) return undefined;
+  const stamp = binaryStamp(agy);
+  if (recorded?.cliPath === agy && stamp !== undefined && recorded.cliStamp === stamp && recorded.cliVersion) {
+    return { path: agy, version: recorded.cliVersion, stamp };
+  }
   try {
     // `acp --version` both proves the subcommand exists and reports the
     // bundled server version; a CLI without it must not be selected.
     const { stdout } = await execFileAsync(agy, ["acp", "--version"], { timeout: CLI_VERSION_TIMEOUT_MS });
     const version = /\d+\.\d+\.\d+/.exec(stdout)?.[0];
-    return version ? { path: agy, version } : undefined;
+    return version ? { path: agy, version, stamp } : undefined;
   } catch {
     return undefined;
   }

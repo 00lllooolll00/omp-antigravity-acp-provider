@@ -15,6 +15,7 @@ export class CatalogStore {
   readonly upstreamModels = new Map<string, ConfiguredCatalogModel>();
   currentModels: ConfiguredCatalogModel[] = [];
   private sourceModels: PublicCatalogModel[] = [];
+  private upstreamKnown = false;
   private dynamicCache?: { stamp?: string; settings: string; models: ConfiguredCatalogModel[] };
   private discovery?: Promise<AdvertisedModel[]>;
   private refreshing?: Promise<ConfiguredCatalogModel[]>;
@@ -30,9 +31,9 @@ export class CatalogStore {
       options => new TierConnection(options),
   ) {}
 
-  projectWithSettings(models: PublicCatalogModel[], settings: ContextSettings): ConfiguredCatalogModel[] {
+  projectWithSettings(models: PublicCatalogModel[], settings: ContextSettings, upstreamKnown = true): ConfiguredCatalogModel[] {
     const projected = this.project(models, settings);
-    this.install(projected, models, settings);
+    this.install(projected, models, settings, upstreamKnown);
     return projected;
   }
 
@@ -54,15 +55,23 @@ export class CatalogStore {
     });
   }
 
-  private install(models: ConfiguredCatalogModel[], sources: PublicCatalogModel[], settings: ContextSettings) {
+  private install(
+    models: ConfiguredCatalogModel[],
+    sources: PublicCatalogModel[],
+    settings: ContextSettings,
+    upstreamKnown = true,
+  ) {
     // Publish only after every model validates. Preserve source limits so a
     // removed override does not inherit the previous projected values.
     this.sourceModels = sources;
     this.latestSettings = settings;
     this.currentModels = models;
     this.dynamicCache = undefined;
+    this.upstreamKnown = upstreamKnown;
     this.upstreamModels.clear();
-    for (const model of models) this.upstreamModels.set(model.id, model);
+    if (upstreamKnown) {
+      for (const model of models) this.upstreamModels.set(model.id, model);
+    }
   }
 
   readCachedCatalog(): AdvertisedModel[] {
@@ -76,7 +85,7 @@ export class CatalogStore {
   loadInitialOrCached(settings: ContextSettings): ConfiguredCatalogModel[] {
     const cached = this.readCachedCatalog();
     const base = cached.length ? projectCatalog(cached) : this.fallbackModels();
-    this.currentModels = this.projectWithSettings(base, settings);
+    this.currentModels = this.projectWithSettings(base, settings, cached.length > 0);
     return this.currentModels;
   }
 
@@ -94,13 +103,13 @@ export class CatalogStore {
     }
     const cached = this.readCachedCatalog();
     const base = cached.length ? projectCatalog(cached) : this.fallbackModels();
-    const models = this.projectWithSettings(base, settings);
+    const models = this.projectWithSettings(base, settings, cached.length > 0);
     this.dynamicCache = { stamp, settings: settingsKey, models };
     return models;
   }
 
   reconfigure(settings: ContextSettings): ConfiguredCatalogModel[] {
-    return this.projectWithSettings(this.sourceModels, settings);
+    return this.projectWithSettings(this.sourceModels, settings, this.upstreamKnown);
   }
 
   async discoverModels(): Promise<AdvertisedModel[]> {

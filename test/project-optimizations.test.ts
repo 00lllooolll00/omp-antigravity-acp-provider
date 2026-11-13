@@ -217,6 +217,87 @@ test("catalog cache notices in-place settings changes and reuses missing-file fa
   } finally { await fs.rm(state, { recursive: true, force: true }); }
 });
 
+test("missing cache keeps offline fallbacks out of upstreamModels until discovery runs", async () => {
+  const state = await fs.mkdtemp(path.join(os.tmpdir(), "omp-catalog-unverified-"));
+  try {
+    const store = new CatalogStore(path.join(state, "models-cache.json"), {} as any, async () => {}, () => [
+      { id: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen", api: "antigravity-acp", provider: "antigravity-acp",
+        baseUrl: "", reasoning: true, input: ["text", "image"], contextWindow: 1_000_000, maxTokens: 65_536,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        thinkingLevelMap: { low: "gemini-4-hydrogen-low", medium: "gemini-4-hydrogen-medium", high: "gemini-4-hydrogen-high" },
+        thinking: { mode: "effort", efforts: ["low", "medium", "high"], defaultLevel: "high" } },
+    ]);
+    const settings = { defaults: {}, models: {} };
+    assert.equal(store.loadInitialOrCached(settings).length, 1);
+    assert.equal(store.upstreamModels.size, 0);
+    assert.equal(store.getDynamicModels(settings).length, 1);
+    assert.equal(store.upstreamModels.size, 0);
+    assert.equal(store.reconfigure({ defaults: { contextWindow: 131_072 }, models: {} }).length, 1);
+    assert.equal(store.upstreamModels.size, 0);
+
+    store.discoverModels = async () => [{
+      modelId: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen", selector: true,
+      thoughtLevels: ["low", "medium", "high", "xhigh"], defaultThoughtLevel: "medium",
+    }];
+    const refreshed = await store.refresh(settings);
+    assert.deepEqual(refreshed[0]?.thinking?.efforts, ["low", "medium", "high", "xhigh"]);
+    assert.equal(store.upstreamModels.has("gemini-4-hydrogen"), true);
+  } finally { await fs.rm(state, { recursive: true, force: true }); }
+});
+
+test("first streamSimple with missing cache runs discovery, writes models-cache.json and updates provider efforts", async () => {
+  const state = await fs.mkdtemp(path.join(os.tmpdir(), "omp-stream-discovery-"));
+  const previousBin = process.env.AGY_ACP_BIN, previousKey = process.env.GEMINI_API_KEY;
+  const registrations: any[] = [];
+  let provider: any;
+  const hooks = new Map<string, Function>();
+  let discoveries = 0;
+  try {
+    process.env.AGY_ACP_BIN = process.execPath;
+    process.env.GEMINI_API_KEY = "test-key";
+    const sessionState = {
+      configOptions: [
+        { id: "model", category: "model", type: "select", currentValue: "gemini-4-hydrogen",
+          options: [{ value: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen" }] },
+        { id: "thinking_level", category: "thought_level", type: "select", currentValue: "medium",
+          options: ["low", "medium", "high", "xhigh"].map(value => ({ value, name: value })) },
+      ],
+    };
+    await registerOmpAdapter({
+      on: (name, fn) => hooks.set(name, fn),
+      registerTool() {},
+      registerCommand() {},
+      registerProvider: (_name, value) => { provider = value; registrations.push(value); },
+    }, state, () => ({
+      activePrompts: 0,
+      process: { exited: Promise.resolve() },
+      async initialize() {},
+      async newSession() { discoveries++; return { sessionId: "disc-1", ...sessionState }; },
+      async setModel() {},
+      getSessionState() { return sessionState; },
+      async discardSession() {},
+      async close() {},
+      prompt() { throw new Error("stop after discovery"); },
+    }) as any);
+    const hydrogen = provider.models.find((model: any) => model.id === "gemini-4-hydrogen");
+    assert.ok(hydrogen);
+    const events: any[] = [];
+    for await (const event of provider.streamSimple(hydrogen,
+      { messages: [{ role: "user", content: "synthetic", timestamp: 1 }], tools: [] }, {})) events.push(event);
+    assert.equal(discoveries >= 1, true, "missing cache must trigger ACP discovery before inference");
+    const cached = JSON.parse(await fs.readFile(path.join(state, "models-cache.json"), "utf8"));
+    assert.equal(cached.models[0].modelId, "gemini-4-hydrogen");
+    assert.deepEqual(cached.models[0].thoughtLevels, ["low", "medium", "high", "xhigh"]);
+    const updatedHydrogen = registrations.at(-1)?.models.find((model: any) => model.id === "gemini-4-hydrogen");
+    assert.deepEqual(updatedHydrogen?.thinking?.efforts, ["low", "medium", "high", "xhigh"]);
+  } finally {
+    await hooks.get("session_shutdown")?.({}, {});
+    if (previousBin === undefined) delete process.env.AGY_ACP_BIN; else process.env.AGY_ACP_BIN = previousBin;
+    if (previousKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousKey;
+    await fs.rm(state, { recursive: true, force: true });
+  }
+});
+
 test("account session counts reuse unchanged files but follow rewrites and stat failures", async t => {
   const state = await fs.mkdtemp(path.join(os.tmpdir(), "omp-account-count-"));
   const file = path.join(state, "sessions.json");

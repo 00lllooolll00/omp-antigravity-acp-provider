@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { createRequire as makeRequire } from "node:module";
 import path from "node:path";
 
 export interface StepUsage {
@@ -15,26 +16,49 @@ export interface StepUsageBatch {
   usage: StepUsage & { totalTokens: number };
 }
 
-type DatabaseSync = new (path: string, options?: { readOnly?: boolean; timeout?: number }) => {
+interface SqliteDatabase {
   prepare(sql: string): {
     get(...params: unknown[]): Record<string, unknown> | undefined;
     all(...params: unknown[]): Record<string, unknown>[];
   };
+  exec?(sql: string): unknown;
   close(): void;
-};
+}
 
-let cachedDatabaseSync: DatabaseSync | null | undefined;
+type NodeDatabaseConstructor = new (path: string, options?: { readOnly?: boolean; timeout?: number }) => SqliteDatabase;
+type BunDatabaseConstructor = new (path: string, options?: { readonly?: boolean }) => SqliteDatabase;
 
-function loadDatabaseSync(): DatabaseSync | undefined {
-  if (cachedDatabaseSync !== undefined) return cachedDatabaseSync ?? undefined;
+let cachedOpener: ((dbPath: string) => SqliteDatabase) | null | undefined;
+
+function resolveOpener(): ((dbPath: string) => SqliteDatabase) | undefined {
+  if (cachedOpener !== undefined) return cachedOpener ?? undefined;
   try {
+    if ((process.versions as Record<string, string | undefined>).bun) {
+      // Keep the specifier non-literal so node-targeted bundling does not try to resolve bun:sqlite.
+      const bunModule = "bun:sqlite";
+      const sqlite = makeRequire(import.meta.url)(bunModule) as { Database?: BunDatabaseConstructor } | undefined;
+      if (typeof sqlite?.Database === "function") {
+        const BunDatabase = sqlite.Database;
+        cachedOpener = (dbPath: string) => {
+          const db = new BunDatabase(dbPath, { readonly: true });
+          try { db.exec?.("PRAGMA busy_timeout = 100;"); } catch { /* Best-effort lock timeout. */ }
+          return db;
+        };
+        return cachedOpener;
+      }
+    }
     const getBuiltin = (process as unknown as { getBuiltinModule?: (id: string) => unknown }).getBuiltinModule;
-    const sqlite = getBuiltin?.("node:sqlite") as { DatabaseSync?: DatabaseSync } | undefined;
-    cachedDatabaseSync = typeof sqlite?.DatabaseSync === "function" ? sqlite.DatabaseSync : null;
+    const sqlite = getBuiltin?.("node:sqlite") as { DatabaseSync?: NodeDatabaseConstructor } | undefined;
+    if (typeof sqlite?.DatabaseSync === "function") {
+      const NodeDatabase = sqlite.DatabaseSync;
+      cachedOpener = (dbPath: string) => new NodeDatabase(dbPath, { readOnly: true, timeout: 100 });
+      return cachedOpener;
+    }
   } catch {
-    cachedDatabaseSync = null;
+    // Fall through to mark SQLite unavailable in this runtime.
   }
-  return cachedDatabaseSync ?? undefined;
+  cachedOpener = null;
+  return undefined;
 }
 
 export function conversationDbPath(acpDirectory: string, sessionId: string): string {
@@ -138,10 +162,10 @@ export function decodeModelUsageStats(metadata: Uint8Array): StepUsage | undefin
 
 export function peekMaxModelStepIdx(dbPath: string): number {
   if (!existsSync(dbPath)) return -1;
-  const Database = loadDatabaseSync();
-  if (Database === undefined) return -1;
+  const openDb = resolveOpener();
+  if (openDb === undefined) return -1;
   try {
-    const db = new Database(dbPath, { readOnly: true, timeout: 100 });
+    const db = openDb(dbPath);
     try {
       const row = db.prepare("SELECT COALESCE(MAX(idx), -1) AS maxIdx FROM steps WHERE step_type = 15 AND status = 3").get();
       const raw = row?.maxIdx;
@@ -158,10 +182,10 @@ export function peekMaxModelStepIdx(dbPath: string): number {
 
 export function readModelStepsAfter(dbPath: string, afterIdx: number): StepUsageBatch | undefined {
   if (!existsSync(dbPath)) return undefined;
-  const Database = loadDatabaseSync();
-  if (Database === undefined) return undefined;
+  const openDb = resolveOpener();
+  if (openDb === undefined) return undefined;
   try {
-    const db = new Database(dbPath, { readOnly: true, timeout: 100 });
+    const db = openDb(dbPath);
     try {
       const rows = db.prepare("SELECT idx, metadata FROM steps WHERE step_type = 15 AND status = 3 AND idx > ? ORDER BY idx ASC").all(afterIdx);
       let maxIdx = afterIdx;
