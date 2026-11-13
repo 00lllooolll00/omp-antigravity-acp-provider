@@ -411,3 +411,22 @@ test("credential watcher sends followed-logout notices to the latest OMP context
     logoutFollow.delayMs = originalDelayMs;
   }
 });
+
+test("a marker removal during a fresh login does not close the new ACP runtime", async () => {
+  const originalDelayMs = logoutFollow.delayMs;
+  logoutFollow.delayMs = 5;
+  try {
+    const fixture = authCoordinatorFixture();
+    fixture.coordinator.watchOmpCredentials(fixture.ctx);
+    fixture.storeMarker();
+    await fixture.coordinator.beginFreshGoogleLogin();
+    const baseline = fixture.logoutCallCount();
+    // OMP removes the stale marker while the browser sign-in is still running.
+    fixture.removeMarker();
+    await settle(30);
+    assert.equal(fixture.logoutCallCount(), baseline, "a fresh login must not add a followed logout");
+    assert.equal(fixture.followedNotices().length, 0);
+  } finally {
+    logoutFollow.delayMs = originalDelayMs;
+  }
+});

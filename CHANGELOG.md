@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.45 — 2026-11-13
+
+- Keep a fresh Google login from being cancelled by OMP's stale marker removal. The credential watcher now suppresses the follow-up logout while `beginFreshGoogleLogin()` runs, so the new ACP runtime is not closed mid-sign-in with `ACP connection closed`.
+
 ## 0.1.44 — 2026-11-13
 
 - Detect the Linux Secret Service keyring login. The `agy` CLI stores its Google OAuth token under `service=gemini`, `username=antigravity`; the adapter now reads that item with `secret-tool` when no `acp_token.json` exists, so `authReady()` and `/antigravity-acp account` no longer report `missing` after a successful login and inference is not rejected as signed out. The same item is cleared on `/antigravity-acp logout`, the OMP `/logout` follow-up, and before a fresh `/login`, with a fail-closed refusal when removal cannot be confirmed. Requires `secret-tool` (libsecret) on Linux; when it is unavailable the previous file/API-key behavior is unchanged.

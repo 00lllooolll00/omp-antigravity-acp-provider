@@ -283,6 +283,10 @@ export class OmpAuthCoordinator {
     if (this.deps.isPoolBusy()) {
       throw new Error("Wait for active Antigravity requests to finish before logging in.");
     }
+    // OMP removes the old marker while the browser sign-in is still running.
+    // That generation change must not be mistaken for a user logout and close
+    // the new ACP runtime before the login can finish.
+    this.suppressFollow = true;
     clearTimeout(this.followTimer);
     this.followTimer = undefined;
     clearTimeout(this.followRetry);
