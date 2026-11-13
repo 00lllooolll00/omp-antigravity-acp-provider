@@ -1,7 +1,7 @@
 # omp-antigravity-acp-provider
 
-[![npm version](https://img.shields.io/npm/v/@00lllooolll00%2Fomp-antigravity-acp-provider.svg)](https://www.npmjs.com/package/@00lllooolll00/omp-antigravity-acp-provider)
-[![npm downloads](https://img.shields.io/npm/dm/@00lllooolll00%2Fomp-antigravity-acp-provider.svg)](https://www.npmjs.com/package/@00lllooolll00/omp-antigravity-acp-provider)
+[![npm version](https://img.shields.io/npm/v/@n1netynine99%2Fomp-antigravity-acp-provider.svg)](https://www.npmjs.com/package/@n1netynine99/omp-antigravity-acp-provider)
+[![npm downloads](https://img.shields.io/npm/dm/@n1netynine99%2Fomp-antigravity-acp-provider.svg)](https://www.npmjs.com/package/@n1netynine99/omp-antigravity-acp-provider)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.19-339933?logo=node.js&logoColor=white)](package.json)
 [![OMP marketplace](https://img.shields.io/badge/OMP-marketplace-7c3aed)](https://github.com/00lllooolll00/omp-antigravity-acp-provider)
@@ -51,7 +51,7 @@ omp plugin install omp-antigravity-acp-provider@sencha-plugins
 Or install the published npm package directly:
 
 ```sh
-omp plugin install npm:@00lllooolll00/omp-antigravity-acp-provider
+omp plugin install npm:@n1netynine99/omp-antigravity-acp-provider
 ```
 
 Do not install both. Remove or disable any older Antigravity ACP adapter first.
