@@ -89,6 +89,39 @@ export function assertSelectedAcpCliLaunch(
   }
 }
 
+export async function prepareManagedAcpForQuota(
+  stateDir: string,
+  ensureReady: () => Promise<void>,
+  env: NodeJS.ProcessEnv = process.env,
+  home = os.homedir(),
+  platform: NodeJS.Platform = process.platform,
+): Promise<"custom" | "ready" | "installed"> {
+  const automaticWrapper = path.join(stateDir, "agy-acp-cli.sh");
+  const configured = env.AGY_ACP_BIN?.trim();
+  if (configured && path.resolve(configured) !== path.resolve(automaticWrapper)) {
+    return "custom";
+  }
+  if (resolveManagedAcpCommand(home, platform)) {
+    return "ready";
+  }
+  const saved = env.AGY_ACP_BIN;
+  const hideAutomaticWrapper = configured !== undefined;
+  let ready: Promise<void>;
+  try {
+    if (hideAutomaticWrapper) delete env.AGY_ACP_BIN;
+    // Upstream ensureAntigravityAcpReady resolves AGY_ACP_BIN synchronously before
+    // any await, so restoring the CLI wrapper immediately avoids breaking concurrent inference.
+    ready = ensureReady();
+  } finally {
+    if (hideAutomaticWrapper) {
+      if (saved === undefined) delete env.AGY_ACP_BIN;
+      else env.AGY_ACP_BIN = saved;
+    }
+  }
+  await ready;
+  return "installed";
+}
+
 export async function preferNewestAcpRuntime(
   stateDir: string,
   env: NodeJS.ProcessEnv = process.env,

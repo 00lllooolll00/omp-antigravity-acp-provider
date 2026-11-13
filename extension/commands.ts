@@ -78,6 +78,7 @@ export interface CommandControllerDeps {
   auth: OmpAuthCoordinator;
   catalog: CatalogStore;
   prepareRuntime: () => Promise<void>;
+  prepareQuotaRuntime?: () => Promise<void>;
   getContextSettings: () => ContextSettings;
   setContextSettings: (next: ContextSettings) => void;
   getToolPolicy: () => ToolPolicy;
@@ -552,7 +553,7 @@ export function createAntigravityCommandHandler(deps: CommandControllerDeps) {
 
     if (command === "quota") {
       if (value !== undefined) throw new Error("Usage: /antigravity-acp quota");
-      await deps.prepareRuntime();
+      await (deps.prepareQuotaRuntime ?? deps.prepareRuntime)();
       const lease = deps.acquireRuntimeForSession
         ? deps.acquireRuntimeForSession(sessionIdOf(ctx))
         : { value: deps.getRuntimeForSession(sessionIdOf(ctx)), release: () => {} };

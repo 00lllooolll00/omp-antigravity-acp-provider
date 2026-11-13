@@ -7,6 +7,7 @@ import { applyApiCostEstimate } from "./pricing.ts";
 import {
   assertSelectedAcpCliLaunch,
   preferNewestAcpRuntime,
+  prepareManagedAcpForQuota,
   resolveAcpPermissionProfile,
   type AcpRuntimePreference,
 } from "./acp-runtime-source.ts";
@@ -33,6 +34,7 @@ import {
   type OmpCommandContext,
 } from "./auth-sync.ts";
 import { CatalogStore } from "./catalog-store.ts";
+import { createAntigravityUsageProvider } from "./usage-report.ts";
 import { createAntigravityArgumentCompletions, createAntigravityCommandHandler, type AntigravityCompletionItem, type RuntimeBundleView, type ToolAuditSummary } from "./commands.ts";
 import { formatCompactionNotice } from "./acp-compaction.ts";
 import { classifyAcpFailure } from "./acp-errors.ts";
@@ -150,6 +152,54 @@ export async function registerOmpAdapter(pi: OmpHostApi, stateDir: string,
       throw error;
     });
     return readiness;
+  }
+
+  let managedQuotaReadiness: Promise<void> | undefined;
+  async function prepareManagedRuntimeForQuota(): Promise<void> {
+    await prepareRuntime();
+    if (createConnection !== undefined) return;
+    managedQuotaReadiness ??= prepareManagedAcpForQuota(stateDir, () => ensureAntigravityAcpReady())
+      .then(() => undefined)
+      .catch((error: unknown) => {
+        managedQuotaReadiness = undefined;
+        throw error;
+      });
+    await managedQuotaReadiness;
+  }
+
+  function abortError(): Error {
+    const error = new Error("Aborted");
+    error.name = "AbortError";
+    return error;
+  }
+
+  async function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (!signal) return promise;
+    if (signal.aborted) throw abortError();
+    return await new Promise<T>((resolve, reject) => {
+      const onAbort = () => reject(abortError());
+      signal.addEventListener("abort", onAbort, { once: true });
+      promise.then(
+        value => {
+          signal.removeEventListener("abort", onAbort);
+          resolve(value);
+        },
+        error => {
+          signal.removeEventListener("abort", onAbort);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  async function fetchQuotaSnapshot(signal?: AbortSignal) {
+    await awaitWithAbort(prepareManagedRuntimeForQuota(), signal);
+    const lease = runtimes.acquire();
+    try {
+      return await lease.value.runtime.quota(undefined, signal);
+    } finally {
+      lease.release();
+    }
   }
 
   // Inference and model discovery must not let the ACP server open an
@@ -457,6 +507,7 @@ export async function registerOmpAdapter(pi: OmpHostApi, stateDir: string,
       auth,
       catalog: catalogStore,
       prepareRuntime,
+      prepareQuotaRuntime: prepareManagedRuntimeForQuota,
       getContextSettings: () => contextSettings,
       setContextSettings: next => { contextSettings = next; },
       getToolPolicy: () => toolPolicy,
@@ -501,6 +552,11 @@ export async function registerOmpAdapter(pi: OmpHostApi, stateDir: string,
           // Network discovery is reserved for explicit refresh or first ACP use.
           return catalogStore.getDynamicModels(contextSettings);
         },
+        usage: createAntigravityUsageProvider({
+          authReady,
+          fetchQuota: fetchQuotaSnapshot,
+          getAccountEmail: antigravityAccountEmail,
+        }),
         streamSimple(
           model: { id: string },
           context: { tools?: OmpToolDeclaration[]; systemPrompt?: string | string[]; messages: unknown[] },

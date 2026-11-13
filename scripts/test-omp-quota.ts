@@ -125,8 +125,33 @@ try {
   const prompts = (await trace()).filter(entry => entry.kind === "prompt");
   assert.equal(prompts.length, 1, "the quota path must send exactly one /usage prompt");
   assert.ok(JSON.stringify(prompts[0]!.prompt).includes("/usage"));
-  console.log(JSON.stringify({ omp: version, prompts: prompts.length, groups: 3, argonWeeklyOnly: true }));
-  console.log("Actual OMP /antigravity-acp quota entry: managed quota reply is parsed and rendered: PASS");
+
+  // Native OMP /usage show command: fetches provider.usage report and renders Antigravity pools
+  const beforeNativeCount = frames.length;
+  const nativeSent = await command("prompt", { message: "/usage show" });
+  assert.equal(nativeSent.data?.agentInvoked, false, JSON.stringify(nativeSent));
+  await until(
+    () => frames.slice(beforeNativeCount).find(frame => JSON.stringify(frame).includes("Gemini Models")),
+    "native /usage show output",
+  );
+  assert.equal((await trace()).filter(entry => entry.kind === "prompt").length, 2, "native /usage show should run one /usage ACP prompt");
+  const usageText = frames.slice(beforeNativeCount).map(frame => JSON.stringify(frame)).join("\n");
+  assert.match(usageText, /Gemini Models/);
+  assert.match(usageText, /Claude and GPT models/);
+  assert.match(usageText, /Gemini 4 Argon/);
+  assert.match(usageText, /98\.0% left/);
+  assert.match(usageText, /29\.0% left/);
+
+  // Second immediate /usage show hits OMP UsageManager cache without spawning another ACP session
+  const beforeCachedCount = frames.length;
+  const cachedSent = await command("prompt", { message: "/usage show" });
+  assert.equal(cachedSent.data?.agentInvoked, false, JSON.stringify(cachedSent));
+  await delay(100);
+  assert.equal((await trace()).filter(entry => entry.kind === "prompt").length, 2, "cached /usage show must not re-query ACP");
+  assert.match(frames.slice(beforeCachedCount).map(frame => JSON.stringify(frame)).join("\n"), /Gemini Models/);
+
+  console.log(JSON.stringify({ omp: version, prompts: 2, groups: 3, cached: true }));
+  console.log("Actual OMP /antigravity-acp quota and /usage show: PASS");
 } catch (error) {
   console.error(JSON.stringify({
     notices: frames.filter(frame => frame.type === "notice"),

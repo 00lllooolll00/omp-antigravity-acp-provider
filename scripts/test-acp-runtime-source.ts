@@ -9,7 +9,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { assertSelectedAcpCliLaunch, preferNewestAcpRuntime, resolveAcpPermissionProfile, resolveManagedAcpCommand } from "../extension/acp-runtime-source.ts";
+import { assertSelectedAcpCliLaunch, preferNewestAcpRuntime, prepareManagedAcpForQuota, resolveAcpPermissionProfile, resolveManagedAcpCommand } from "../extension/acp-runtime-source.ts";
 
 const work = fs.mkdtempSync(path.join(os.tmpdir(), "acp-runtime-source-"));
 const bin = path.join(work, "bin");
@@ -203,6 +203,44 @@ for (const script of ["exit 1", "echo prerelease"]) {
   assert.equal(third.cliVersion, "2.1.0");
   assert.notEqual(third.cliStamp, first.cliStamp);
   assert.equal(fs.readFileSync(countFile, "utf8").trim().split("\n").length, 2);
+}
+{
+  stubAgy("echo 3.0.0");
+  fs.rmSync(path.join(home, ".local"), { recursive: true, force: true });
+  const env = freshEnv();
+  const stateDir = freshStateDir();
+  const preference = await preferNewestAcpRuntime(stateDir, env, home);
+  assert.equal(preference.source, "cli");
+  const wrapper = env.AGY_ACP_BIN;
+  assert.ok(wrapper?.endsWith("agy-acp-cli.sh"));
+
+  let sawEnvDuringSyncStart: string | undefined = "sentinel";
+  let installCalls = 0;
+  const installed = await prepareManagedAcpForQuota(stateDir, async () => {
+    sawEnvDuringSyncStart = env.AGY_ACP_BIN;
+    installCalls++;
+    await Promise.resolve();
+    assert.equal(env.AGY_ACP_BIN, wrapper, "cli wrapper must already be restored across async install work");
+    setManagedVersion("1.4.5");
+  }, env, home);
+  assert.equal(installed, "installed");
+  assert.equal(installCalls, 1);
+  assert.equal(sawEnvDuringSyncStart, undefined);
+  assert.equal(env.AGY_ACP_BIN, wrapper);
+
+  const alreadyReady = await prepareManagedAcpForQuota(stateDir, async () => {
+    installCalls++;
+  }, env, home);
+  assert.equal(alreadyReady, "ready");
+  assert.equal(installCalls, 1);
+
+  env.AGY_ACP_BIN = "/opt/custom-quota-bin";
+  const custom = await prepareManagedAcpForQuota(stateDir, async () => {
+    installCalls++;
+  }, env, home);
+  assert.equal(custom, "custom");
+  assert.equal(installCalls, 1);
+  assert.equal(env.AGY_ACP_BIN, "/opt/custom-quota-bin");
 }
 
 fs.rmSync(work, { recursive: true, force: true });
