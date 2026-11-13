@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Detect the Linux Secret Service keyring login. The `agy` CLI stores its Google OAuth token under `service=gemini`, `username=antigravity`; the adapter now reads that item with `secret-tool` when no `acp_token.json` exists, so `authReady()` and `/antigravity-acp account` no longer report `missing` after a successful login and inference is not rejected as signed out. The same item is cleared on `/antigravity-acp logout`, the OMP `/logout` follow-up, and before a fresh `/login`, with a fail-closed refusal when removal cannot be confirmed. Requires `secret-tool` (libsecret) on Linux; when it is unavailable the previous file/API-key behavior is unchanged.
+- Add Gemini 4 Hydrogen to the offline fallback catalog through a shared `offlineFallbackModels()` list, so a fresh install or an unresolved login still exposes Hydrogen before the first ACP discovery.
 
 ## 0.1.43 — 2026-11-11
 

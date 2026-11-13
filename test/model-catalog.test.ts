@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { projectCatalog, readModels, thoughtRoute, parseThoughtRoute, selectRuntimeModel } from "../extension/model-catalog.ts";
+import { offlineFallbackModels } from "../extension/index.ts";
 import { advertisedRecord, choices, resolveSelection } from "../extension/selectors.ts";
 
 const state = (models: string[], levels = ["low", "medium", "high"]) => ({ configOptions: [
@@ -102,4 +103,13 @@ test("local routes reject removed models and malformed payloads", () => {
   assert.throws(() => resolveSelection(state(["other"]), thoughtRoute("removed", "high")), /no longer advertises/);
   assert.throws(() => parseThoughtRoute("__omp_acp_thought__:bad-data"), /Invalid local/);
   assert.deepEqual(resolveSelection(state(["claude"]), thoughtRoute("claude", "max")), { modelId: "claude", effort: "max" });
+});
+
+test("offline fallback exposes Hydrogen and Argon before discovery", () => {
+  const fallback = offlineFallbackModels();
+  const byId = new Map(fallback.map(model => [model.id, model]));
+  assert.ok(byId.has("gemini-4-hydrogen"), "a fresh install must see Hydrogen without a refresh");
+  assert.ok(byId.has("gemini-4-argon"));
+  assert.deepEqual(byId.get("gemini-4-hydrogen")?.thinking?.efforts, ["low", "medium", "high"]);
+  assert.deepEqual(byId.get("gemini-4-argon")?.thinking?.efforts, ["low", "medium", "high"]);
 });

@@ -78,6 +78,22 @@ export function resolveAdapterStateDir(env: NodeJS.ProcessEnv = process.env, hom
   return path.join(agentDir, "antigravity-acp-provider");
 }
 
+// Offline catalog used before the first ACP discovery. Keep the newest
+// families here so a fresh install or an auth gap still exposes them.
+export function offlineFallbackModels(): PublicCatalogModel[] {
+  return [
+    ...(FALLBACK_MODELS as PublicCatalogModel[]),
+    ...projectCatalog([
+      { modelId: "gemini-4-argon-low", name: "Gemini 4 Argon (low)" },
+      { modelId: "gemini-4-argon-medium", name: "Gemini 4 Argon (medium)" },
+      { modelId: "gemini-4-argon-high", name: "Gemini 4 Argon (high)" },
+      { modelId: "gemini-4-hydrogen-low", name: "Gemini 4 Hydrogen (low)" },
+      { modelId: "gemini-4-hydrogen-medium", name: "Gemini 4 Hydrogen (medium)" },
+      { modelId: "gemini-4-hydrogen-high", name: "Gemini 4 Hydrogen (high)" },
+    ]),
+  ];
+}
+
 export default async function (pi: OmpHostApi) {
   return registerOmpAdapter(pi, resolveAdapterStateDir());
 }
@@ -317,14 +333,7 @@ export async function registerOmpAdapter(pi: OmpHostApi, stateDir: string,
     cachePath,
     cleanup,
     prepareRuntime,
-    () => [
-      ...(FALLBACK_MODELS as PublicCatalogModel[]),
-      ...projectCatalog([
-        { modelId: "gemini-4-argon-low", name: "Gemini 4 Argon (low)" },
-        { modelId: "gemini-4-argon-medium", name: "Gemini 4 Argon (medium)" },
-        { modelId: "gemini-4-argon-high", name: "Gemini 4 Argon (high)" },
-      ]),
-    ],
+    offlineFallbackModels,
     requireAcpAuth,
     spawnConnection,
   );
