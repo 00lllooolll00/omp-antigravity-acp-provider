@@ -93,6 +93,9 @@ jobs:
         with:
           node-version: 22.19.0
 
+      - name: Use npm with trusted publishing support
+        run: npm install --global npm@11.21.2
+
       - name: Configure npm authentication
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
