@@ -29,6 +29,7 @@ import {
   authReady,
   keychain,
   logoutFollow,
+  secretService,
   type OmpCommandContext,
 } from "./auth-sync.ts";
 import { CatalogStore } from "./catalog-store.ts";
@@ -52,7 +53,7 @@ import {
   planToolProjection,
 } from "./runtime.mjs";
 
-export { keychain, logoutFollow };
+export { keychain, logoutFollow, secretService };
 
 interface OmpHostApi {
   on: (name: string, handler: (event: unknown, ctx: OmpCommandContext) => unknown) => void;

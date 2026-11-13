@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { registerOmpAdapter, keychain, logoutFollow } from "../extension/index.ts";
+import { registerOmpAdapter, keychain, logoutFollow, secretService } from "../extension/index.ts";
 import { AntigravityRuntime } from "../extension/runtime.mjs";
 import { SessionRuntimePool } from "../extension/runtime-pool.ts";
 
@@ -18,6 +18,8 @@ process.env.GEMINI_HOME = geminiHome;
 process.env.AGY_ACP_BIN = process.execPath;
 const originalPresent = keychain.present;
 const originalRemove = keychain.remove;
+const originalSecretPresent = secretService.present;
+const originalSecretRemove = secretService.remove;
 const originalLoginGoogle = AntigravityRuntime.prototype.loginGoogle;
 const originalPoolValues = SessionRuntimePool.prototype.values;
 const originalDelayMs = logoutFollow.delayMs;
@@ -30,6 +32,10 @@ let command: any;
 try {
   let keychainEntry = true;
   let flushOnce = false;
+  // This fixture exercises the macOS keychain path on every host; keep the
+  // Linux Secret Service probe away from the real user keyring.
+  secretService.present = async () => undefined;
+  secretService.remove = async () => undefined;
   keychain.present = async () => { keychainCalls.push("present"); return keychainEntry; };
   keychain.remove = async () => {
     keychainCalls.push("remove");
@@ -248,6 +254,8 @@ try {
 } finally {
   keychain.present = originalPresent;
   keychain.remove = originalRemove;
+  secretService.present = originalSecretPresent;
+  secretService.remove = originalSecretRemove;
   AntigravityRuntime.prototype.loginGoogle = originalLoginGoogle;
   SessionRuntimePool.prototype.values = originalPoolValues;
   logoutFollow.delayMs = originalDelayMs;
