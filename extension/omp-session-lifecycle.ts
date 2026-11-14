@@ -8,6 +8,8 @@ interface Scope extends OmpProviderSessionState {
 // OMP can rotate provider routing identity without changing its transcript ID
 // (/fresh, reset), and side requests have their own routing IDs. Honor the
 // host's lifecycle contract instead of inferring ownership from UI events.
+type OwnerOf = (id: RoutingId) => RoutingId;
+
 export class OmpSessionLifecycle {
   private readonly scopes = new WeakMap<Map<string, OmpProviderSessionState>, Scope>();
   private readonly tickets = new Map<RoutingId, Set<Ticket>>();
@@ -16,8 +18,9 @@ export class OmpSessionLifecycle {
   private readonly fallback = this.newScope();
 
   constructor(private readonly closeRuntime: (id: RoutingId) => Promise<void>,
-    private readonly releaseRuntime: (id: RoutingId) => Promise<void> = async () => {}) {}
-
+    private readonly releaseRuntime: (id: RoutingId) => Promise<void> = async () => {},
+    private readonly ownerOf: OwnerOf = id => id,
+    private readonly closeOwnedBinding: (ownerId: RoutingId, sessionId: string) => Promise<void> = async () => {}) {}
   private newScope(predecessor?: Promise<void>): Scope {
     // Observe failures immediately; ready() still surfaces them before dispatch.
     void predecessor?.catch(() => {});
@@ -120,7 +123,12 @@ export class OmpSessionLifecycle {
 
   closeSession(id: RoutingId, released = false): Promise<void> {
     for (const ticket of [...this.tickets.get(id) ?? []]) { ticket.closed = true; ticket.scope.retainedIds.delete(id); this.forget(ticket); }
-    const previous = this.closing.get(id), closed = this.closeRuntime(id), teardown = this.closing.get(id);
+    const owner = this.ownerOf(id);
+    const previous = this.closing.get(id);
+    const closed = released && owner !== id
+      ? (typeof id === "string" ? this.closeOwnedBinding(owner, id) : Promise.resolve())
+      : this.closeRuntime(owner);
+    const teardown = this.closing.get(id);
     const pending = Promise.allSettled([previous, closed, teardown]).then(async results => {
       // Teardown failures must not skip unbinding: a leaked release keeps the
       // one-shot mapping alive and the cleanup registry out of sync.

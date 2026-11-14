@@ -88,3 +88,51 @@ test("createAntigravityUsageProvider supports fallback api_key and oauth, respec
   assert.equal(report.metadata?.email, "pool@example.com");
   assert.equal(report.limits[0]?.label, "Claude and GPT models");
 });
+
+test("createAntigravityUsageProvider coalesces concurrent reads and isolates single-subscriber abort", async () => {
+  let quotaCalls = 0;
+  let upstreamSignal: AbortSignal | undefined;
+  const gate = Promise.withResolvers<AntigravityQuotaSnapshot>();
+  const provider = createAntigravityUsageProvider({
+    authReady: async () => true,
+    fetchQuota: async signal => {
+      quotaCalls++;
+      upstreamSignal = signal;
+      return gate.promise;
+    },
+    getAccountEmail: () => "shared@example.com",
+  });
+
+  const sub1 = new AbortController();
+  const sub2 = new AbortController();
+  const p1 = provider.fetchUsage({ provider: "antigravity-acp", credential: { type: "api_key" }, signal: sub1.signal });
+  const p2 = provider.fetchUsage({ provider: "antigravity-acp", credential: { type: "api_key" }, signal: sub2.signal });
+
+  await Promise.resolve();
+  assert.equal(quotaCalls, 1);
+  sub1.abort();
+  assert.equal(await p1, null);
+  assert.equal(upstreamSignal?.aborted, false, "other active subscriber keeps shared upstream fetch alive");
+
+  gate.resolve({ at: 2_000, groups: [{ displayName: "Gemini Models", buckets: [{ window: "5h", remainingFraction: 0.5 }] }] });
+  const r2 = await p2;
+  assert.ok(r2);
+  assert.equal(r2.limits[0]?.amount.remaining, 50);
+
+  const gate2 = Promise.withResolvers<AntigravityQuotaSnapshot>();
+  const provider2 = createAntigravityUsageProvider({
+    authReady: async () => true,
+    fetchQuota: async signal => {
+      upstreamSignal = signal;
+      return gate2.promise;
+    },
+    getAccountEmail: () => undefined,
+  });
+  const onlySub = new AbortController();
+  const p3 = provider2.fetchUsage({ provider: "antigravity-acp", credential: { type: "api_key" }, signal: onlySub.signal });
+  await Promise.resolve();
+  onlySub.abort();
+  assert.equal(await p3, null);
+  assert.equal(upstreamSignal?.aborted, true, "last subscriber abort cancels shared upstream fetch");
+  gate2.resolve({ at: 3_000, groups: [] });
+});

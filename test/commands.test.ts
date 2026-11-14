@@ -192,7 +192,7 @@ test("quota failures are explicit reports and extra arguments do not prepare a r
 test("unknown subcommands and stray arguments fail with usage errors, not a runtime", async () => {
   const fixture = makeHandler();
   await assert.rejects(fixture.handler("unknown", fixture.ctx), /Usage: \/antigravity-acp \[status\|account\|/);
-  await assert.rejects(fixture.handler("permissions invalid", fixture.ctx), /Usage: \/antigravity-acp permissions default\|auto-edit\|yolo/);
+  await assert.rejects(fixture.handler("permissions invalid", fixture.ctx), /Usage: \/antigravity-acp permissions default\|auto-edit\|yolo\|follow/);
   await assert.rejects(fixture.handler("permissions", fixture.ctx), /Usage: \/antigravity-acp permissions/);
   await assert.rejects(fixture.handler("permissions default extra", fixture.ctx), /Usage: \/antigravity-acp permissions/);
   await assert.rejects(fixture.handler("refresh extra", fixture.ctx), /Usage: \/antigravity-acp refresh/);
@@ -518,4 +518,27 @@ test("context set completions walk the target and setting-key positions", () => 
   assert.deepEqual(items("context set default maxT").map(item => item.label), ["maxTokens", "maxTransferBytes"]);
   assert.equal(complete("context set default usageMode "), null);
   assert.equal(complete("context settypo default "), null);
+});
+
+test("permissions follow persists preference, renders follow label in account/status and autocompletes", async () => {
+  const fixture = makeHandler();
+  let preference = "yolo";
+  let effective = "yolo";
+  let closed = 0;
+  fixture.deps.getPermissionPreference = () => preference;
+  fixture.deps.getPermissionMode = () => effective;
+  fixture.deps.setPermissionModeState = mode => {
+    preference = mode;
+    effective = mode === "follow" ? "default" : mode;
+  };
+  fixture.deps.closeAllRuntimes = async () => { closed++; };
+  await fixture.handler("permissions follow", fixture.ctx);
+  assert.equal(closed, 1);
+  assert.equal(JSON.parse(fs.readFileSync(fixture.deps.configPath, "utf8")).permissions, "follow");
+  assert.match(fixture.notices.pop()!, /Permission:\s+requested default \(follow OMP\) → wire yolo/);
+  await fixture.handler("account", fixture.ctx);
+  assert.match(fixture.notices.pop()!, /Permission:\s+default \(follow OMP\)/);
+  const { items } = makeCompletions();
+  assert.deepEqual(items("permissions f").map(item => item.label), ["follow"]);
+  fs.rmSync(fixture.state, { recursive: true, force: true });
 });

@@ -13,10 +13,47 @@ import { Value } from "typebox/value";
 
 import { AntigravityAcpError } from "../acp/errors.js";
 import { PACKAGE_VERSION, PERMISSION_TOOL_NAME } from "../constants.js";
+import { inspectToolArguments, normalizeToolArguments, renderToolSignature } from "../../../../tool-args.ts";
 import { projectToolSchema } from "./schema.js";
 
 const BODY_LIMIT = 1024 * 1024;
 const MAX_TOOLS = 64;
+export const OMP_TASK_TOOL_NAME = "task";
+
+const CONTEXT_CONTROL_TOOLS = new Set(["context_notes", "new_context"]);
+
+export function projectedMcpName(name: string): string {
+	return `pi_${name}`.replace(/[^a-zA-Z0-9_-]/gu, "_").slice(0, 64);
+}
+
+export function bridgeExecutionSchema(tool: Pick<Tool, "name" | "parameters">): Tool["parameters"] {
+	const parameters = tool.parameters;
+	if (!CONTEXT_CONTROL_TOOLS.has(tool.name) || parameters === null || typeof parameters !== "object" || Array.isArray(parameters)) {
+		return parameters;
+	}
+	const schema = parameters as unknown as Record<string, unknown>;
+	const properties = schema.properties;
+	const required = schema.required;
+	if (schema.type !== "object" || schema.additionalProperties !== false ||
+		properties === null || typeof properties !== "object" || Array.isArray(properties) ||
+		!Array.isArray(required) || !required.includes("i")) {
+		return parameters;
+	}
+	const expectedKeys = tool.name === "context_notes" ? ["i", "text"] : ["i"];
+	if (Object.keys(properties).length !== expectedKeys.length ||
+		!expectedKeys.every(key => Object.hasOwn(properties, key))) {
+		return parameters;
+	}
+	const intent = Reflect.get(properties, "i");
+	const text = Reflect.get(properties, "text");
+	if (intent === null || typeof intent !== "object" || Array.isArray(intent) || Reflect.get(intent, "type") !== "string" ||
+		(tool.name === "context_notes" && (text === null || typeof text !== "object" || Array.isArray(text) || Reflect.get(text, "type") !== "string"))) {
+		return parameters;
+	}
+	// These two native tools receive OMP's injected intent as call metadata,
+	// not as an execute argument. Keep the property and supplied value intact.
+	return { ...schema, required: required.filter(key => key !== "i") } as Tool["parameters"];
+}
 
 interface BridgeTool {
 	mcpName: string;
@@ -58,21 +95,36 @@ export function planToolProjection(tools: readonly Tool[]): ToolOmission[] {
 	return omissions;
 }
 
+export function planProjectedToolNames(tools: readonly Tool[]): readonly string[] {
+	return projectTools(tools, []).map(tool => tool.piName);
+}
+
 export class PiMcpBridge {
-	readonly fingerprint: string;
+	fingerprint: string;
 	readonly omissions: ToolOmission[] = [];
 	private readonly token = crypto.randomUUID().replaceAll("-", "");
-	private readonly tools: BridgeTool[];
+	private tools: BridgeTool[];
 	private server: ReturnType<typeof createServer> | undefined;
 	private url: string | undefined;
+	private readonly responses = new Set<ServerResponse>();
 
 	constructor(private readonly options: PiMcpBridgeOptions) {
 		this.tools = projectTools(options.tools, this.omissions);
 		this.fingerprint = projectionFingerprint(this.tools, this.omissions);
 	}
 
+	updateTools(tools: readonly Tool[]): void {
+		this.omissions.length = 0;
+		this.tools = projectTools(tools, this.omissions);
+		this.fingerprint = projectionFingerprint(this.tools, this.omissions);
+	}
+
 	get empty(): boolean {
 		return this.tools.length === 0;
+	}
+
+	get projectedToolNames(): readonly string[] {
+		return this.tools.map(tool => tool.piName);
 	}
 
 	async start(): Promise<AcpMcpServer | undefined> {
@@ -85,6 +137,9 @@ export class PiMcpBridge {
 			});
 		});
 		this.server.maxConnections = 8;
+		this.server.keepAliveTimeout = 0;
+		this.server.requestTimeout = 0;
+		this.server.headersTimeout = 0;
 		await new Promise<void>((resolve, reject) => {
 			this.server?.once("error", reject);
 			this.server?.listen(0, "127.0.0.1", resolve);
@@ -100,7 +155,11 @@ export class PiMcpBridge {
 		this.server = undefined;
 		this.url = undefined;
 		if (!server) return;
-		await new Promise<void>((resolve) => server.close(() => resolve()));
+		const closing = new Promise<void>((resolve) => server.close(() => resolve()));
+		for (const response of this.responses) response.destroy();
+		this.responses.clear();
+		server.closeAllConnections();
+		await closing;
 	}
 
 	private descriptor(): AcpMcpServer {
@@ -114,6 +173,8 @@ export class PiMcpBridge {
 	}
 
 	private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+		this.responses.add(response);
+		response.once("close", () => this.responses.delete(response));
 		if (request.url !== "/mcp" || request.method !== "POST") {
 			response.writeHead(405).end();
 			return;
@@ -122,7 +183,17 @@ export class PiMcpBridge {
 			response.writeHead(401).end();
 			return;
 		}
-		const body = await readJson(request);
+		let body: unknown;
+		try {
+			body = await readJson(request);
+		} catch (error) {
+			if (error instanceof SyntaxError) {
+				response.writeHead(400, { "content-type": "application/json" });
+				response.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }));
+				return;
+			}
+			throw error;
+		}
 		const protocol = new Server(
 			{ name: "pi-antigravity-acp-tools", version: PACKAGE_VERSION },
 			{ capabilities: { tools: {} } },
@@ -138,14 +209,19 @@ export class PiMcpBridge {
 			const tool = this.tools.find((candidate) => candidate.mcpName === call.params.name);
 			if (!tool) return toolError("Unknown or inactive Pi tool");
 			const args = call.params.arguments ?? {};
+			const normalized = normalizeToolArguments(tool.originalSchema, args);
+			const missing = inspectToolArguments(tool.originalSchema, normalized.arguments).missing;
+			let ompValidated = true;
 			try {
-				if (!Value.Check(tool.originalSchema, args)) {
-					return toolError("Arguments failed the original Pi tool schema");
-				}
+				if (!Value.Check(tool.originalSchema, normalized.arguments)) ompValidated = false;
 			} catch {
-				return toolError("The original Pi tool schema could not validate these arguments");
+				return toolError(tool.mcpName + ": the original Pi tool schema could not validate these arguments. Expected signature: " + renderToolSignature(tool.mcpName, tool.originalSchema) + ". Correct the parameters and retry without repeating the same call.");
 			}
-			return this.options.onCall({ id: crypto.randomUUID(), name: tool.piName, arguments: args });
+			if (!ompValidated || missing.length > 0) {
+				const ompMissing = missing.length > 0 ? "missing required " + missing.join(", ") + ". " : "";
+				return toolError(tool.mcpName + ": " + ompMissing + "Expected signature: " + renderToolSignature(tool.mcpName, tool.originalSchema) + ". Correct the parameters and retry without repeating the same call.");
+			}
+			return this.options.onCall({ id: crypto.randomUUID(), name: tool.piName, arguments: normalized.arguments });
 		});
 		const transport = new StreamableHTTPServerTransport(
 			{ sessionIdGenerator: undefined } as unknown as ConstructorParameters<
@@ -162,36 +238,77 @@ export class PiMcpBridge {
 	}
 }
 
-function projectTools(tools: readonly Tool[], omissions: ToolOmission[]): BridgeTool[] {
-	const output: BridgeTool[] = [];
-	const names = new Set<string>();
-	for (const tool of tools) {
-		if (tool.name === PERMISSION_TOOL_NAME) continue;
-		if (output.length >= MAX_TOOLS) {
-			omissions.push({ name: tool.name, reason: `Tool limit ${MAX_TOOLS} reached` });
-			continue;
-		}
-		const mcpName = `pi_${tool.name}`.replace(/[^a-zA-Z0-9_-]/gu, "_").slice(0, 64);
-		if (!mcpName || names.has(mcpName)) {
-			omissions.push({ name: tool.name, reason: "duplicate or invalid projected name" });
-			continue;
-		}
-		const projected = projectToolSchema(tool.parameters);
-		if ("reason" in projected) {
-			omissions.push({ name: tool.name, reason: `schema omitted (${projected.reason})` });
-			continue;
-		}
-		const inputSchema = projected.schema;
-		names.add(mcpName);
-		output.push({
-			mcpName,
-			piName: tool.name,
-			description: tool.description,
-			inputSchema,
-			originalSchema: tool.parameters,
-		});
+function projectTool(tool: Tool, names: Set<string>): BridgeTool | ToolOmission {
+	const mcpName = projectedMcpName(tool.name);
+	if (!mcpName || names.has(mcpName)) {
+		return { name: tool.name, reason: "duplicate or invalid projected name" };
 	}
-	return output;
+	const originalSchema = bridgeExecutionSchema(tool);
+	const projected = projectToolSchema(originalSchema);
+	if ("reason" in projected) {
+		return { name: tool.name, reason: `schema omitted (${projected.reason})` };
+	}
+	names.add(mcpName);
+	return {
+		mcpName,
+		piName: tool.name,
+		description: tool.description,
+		inputSchema: projected.schema,
+		originalSchema,
+	};
+}
+
+// Keep the first 64 projectable tools in OMP's input order. When `task` would
+// fall beyond that boundary, hold one slot open so the delegated-work
+// declaration survives without moving any retained tool.
+function projectTools(tools: readonly Tool[], omissions: ToolOmission[]): BridgeTool[] {
+	const selected = new Map<number, BridgeTool>();
+	const rejected = new Map<number, string>();
+	const limitSkipped = new Set<number>();
+	const names = new Set<string>();
+	const taskPresent = tools.some((tool) => tool.name === OMP_TASK_TOOL_NAME);
+	let taskAccepted = false;
+	const attempt = (index: number): void => {
+		const result = projectTool(tools[index]!, names);
+		if ("reason" in result) {
+			rejected.set(index, result.reason);
+			return;
+		}
+		selected.set(index, result);
+		if (tools[index]!.name === OMP_TASK_TOOL_NAME) taskAccepted = true;
+	};
+	for (let index = 0; index < tools.length; index++) {
+		const tool = tools[index]!;
+		if (tool.name === PERMISSION_TOOL_NAME) continue;
+		const isTask = tool.name === OMP_TASK_TOOL_NAME;
+		if (!isTask && taskPresent && !taskAccepted && selected.size >= MAX_TOOLS - 1) {
+			limitSkipped.add(index);
+			continue;
+		}
+		if (selected.size >= MAX_TOOLS) {
+			limitSkipped.add(index);
+			continue;
+		}
+		attempt(index);
+	}
+	// A reserved slot is only useful if `task` itself is projectable. If it is
+	// invalid, restore the ordinary first-64 behavior from the earliest skipped
+	// candidates without reordering what was already retained.
+	if (taskPresent && !taskAccepted) {
+		for (const index of [...limitSkipped].sort((a, b) => a - b)) {
+			if (selected.size >= MAX_TOOLS) break;
+			attempt(index);
+			limitSkipped.delete(index);
+		}
+	}
+	for (let index = 0; index < tools.length; index++) {
+		const tool = tools[index]!;
+		if (tool.name === PERMISSION_TOOL_NAME || selected.has(index)) continue;
+		const reason = rejected.get(index);
+		if (reason) omissions.push({ name: tool.name, reason });
+		else if (limitSkipped.has(index)) omissions.push({ name: tool.name, reason: `Tool limit ${MAX_TOOLS} reached` });
+	}
+	return [...selected.entries()].sort(([a], [b]) => a - b).map(([, tool]) => tool);
 }
 
 async function readJson(request: IncomingMessage): Promise<unknown> {

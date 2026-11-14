@@ -107,8 +107,18 @@ export class AntigravityAcpConnection {
 						this.updateSessionState(notification.sessionId, notification.update);
 					} else if (notification.update.sessionUpdate === "current_mode_update") {
 						const state = this.getSessionState(notification.sessionId);
-						if (state.modes) this.sessions.set(notification.sessionId, {
-							...state, modes: { ...state.modes, currentModeId: notification.update.currentModeId },
+						const modeSelector = findSessionSelector(state, "mode");
+						this.sessions.set(notification.sessionId, {
+							...state,
+							...(state.modes
+								? { modes: { ...state.modes, currentModeId: notification.update.currentModeId } }
+								: {}),
+							...(modeSelector && state.configOptions
+								? { configOptions: state.configOptions.map(option =>
+									option.type === "select" && option.id === modeSelector.id
+										? { ...option, currentValue: notification.update.currentModeId }
+										: option) }
+								: {}),
 						});
 					}
 					await this.handlers.onUpdate?.(notification);
@@ -122,6 +132,7 @@ export class AntigravityAcpConnection {
 				clientCapabilities: {
 					fs: { readTextFile: false, writeTextFile: false },
 					terminal: false,
+					session: { compaction: {} },
 				},
 				clientInfo: {
 					name: "pi-antigravity-acp-provider",

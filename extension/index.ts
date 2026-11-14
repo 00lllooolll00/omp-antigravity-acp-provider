@@ -19,7 +19,9 @@ import { stableTools } from "./tool-order.ts";
 import { toolDeclarations, normalizeOmpSystemDeltas, type OmpToolDeclaration } from "./omp-context.ts";
 import { OmpSessionLifecycle, type OmpProviderSessionState } from "./omp-session-lifecycle.ts";
 import { DEFAULT_USAGE_MODE, loadContextSettings } from "./context-settings.ts";
-import { projectCatalog, selectRuntimeModel, type PublicCatalogModel } from "./model-catalog.ts";
+import { PARTNER_FALLBACK_MODELS, projectCatalog, selectRuntimeModel, type PublicCatalogModel } from "./model-catalog.ts";
+import { loadAdapterConfig, resolveAdapterPermissionMode, type AdapterPermissionMode } from "./adapter-config.ts";
+import { ownerRoutingId, sessionOwnerId } from "./routing.ts";
 import { TOOL_ROUTING } from "./tool-routing.ts";
 import { TranscriptRouting, type RoutingAttempt } from "./transcript-routing.ts";
 import { sourceId } from "./omp-session-source.ts";
@@ -37,6 +39,7 @@ import {
 import { CatalogStore } from "./catalog-store.ts";
 import { createAntigravityUsageProvider } from "./usage-report.ts";
 import { createAntigravityArgumentCompletions, createAntigravityCommandHandler, type AntigravityCompletionItem, type RuntimeBundleView, type ToolAuditSummary } from "./commands.ts";
+import type { ConfiguredCatalogModel } from "./catalog-store.ts";
 import { formatCompactionNotice } from "./acp-compaction.ts";
 import { classifyAcpFailure } from "./acp-errors.ts";
 import {
@@ -52,7 +55,6 @@ import {
   Type,
   createAntigravityProvider,
   ensureAntigravityAcpReady,
-  loadConfig,
   planToolProjection,
 } from "./runtime.mjs";
 
@@ -95,6 +97,7 @@ export function offlineFallbackModels(): PublicCatalogModel[] {
       { modelId: "gemini-4-hydrogen-high", name: "Gemini 4 Hydrogen (high)" },
       { modelId: "gemini-4-hydrogen-xhigh", name: "Gemini 4 Hydrogen (xhigh)" },
     ]),
+    ...PARTNER_FALLBACK_MODELS,
   ];
 }
 
@@ -124,7 +127,9 @@ export async function registerOmpAdapter(
   const contextPath = path.join(stateDir, "context.json");
   let contextSettings = loadContextSettings(contextPath);
   let toolPolicy = loadToolPolicy(toolPolicyPath);
-  let permissionMode = loadConfig(configPath).permissions;
+  let permissionPreference: AdapterPermissionMode = loadAdapterConfig(configPath).permissions;
+  const ompAgentDir = path.dirname(stateDir);
+  const effectivePermissionMode = () => resolveAdapterPermissionMode(permissionPreference, ompAgentDir);
   const sessionStorePath = path.join(stateDir, "sessions.json");
   const sessionStore = new AcpSessionStore(sessionStorePath);
   const cleanup = new SessionCleanup(stateDir);
@@ -153,7 +158,7 @@ export async function registerOmpAdapter(
   let readiness: Promise<void> | undefined;
   let runtimePreference: Promise<AcpRuntimePreference | undefined> | undefined;
   let selectedRuntimePreference: AcpRuntimePreference | undefined;
-  const currentPermissionProfile = () => resolveAcpPermissionProfile(selectedRuntimePreference, permissionMode);
+  const currentPermissionProfile = () => resolveAcpPermissionProfile(selectedRuntimePreference, effectivePermissionMode());
   const currentRuntimeKey = () => `${selectedRuntimePreference?.source ?? ""}:${selectedRuntimePreference?.cliPath ?? ""}`;
   const checkAuthReady = adapterOptions?.authReady ?? authReady;
   function prepareRuntime() {
@@ -418,9 +423,12 @@ export async function registerOmpAdapter(
     return makeConnection({ ...options, ...launch, env });
   }
 
-  const lifecycle = new OmpSessionLifecycle(id => runtimes.close(id), async id => {
-    if (id) await cleanup.releaseSession(id);
-  });
+  const lifecycle = new OmpSessionLifecycle(
+    id => runtimes.close(ownerRoutingId(id)),
+    async id => { if (id) await cleanup.releaseSession(id); },
+    ownerRoutingId,
+    async (ownerId, sessionId) => { await runtimes.peek(ownerId)?.runtime.closeSessionBinding?.(sessionId); },
+  );
   const runtimes = new SessionRuntimePool<RuntimeBundleView>(() => {
     const ownedConnections = new Set<TierConnection>();
     const runtime = new AntigravityRuntime((options: ConstructorParameters<typeof TierConnection>[0]) => {
@@ -612,7 +620,18 @@ export async function registerOmpAdapter(
     requireAcpAuth,
     spawnConnection,
   );
-  let initialModels = catalogStore.loadInitialOrCached(contextSettings);
+  let initialModels: ConfiguredCatalogModel[];
+  try {
+    initialModels = catalogStore.loadInitialOrCached(contextSettings);
+  } catch (error) {
+    console.warn("[antigravity-acp] Context budgets do not fit the catalog; using model defaults.", error instanceof Error ? error.message : String(error));
+    contextSettings = { defaults: { usageMode: contextSettings.defaults.usageMode }, models: {} };
+    try {
+      initialModels = catalogStore.loadInitialOrCached(contextSettings);
+    } catch {
+      initialModels = catalogStore.projectWithSettings(offlineFallbackModels(), contextSettings, false);
+    }
+  }
 
   pi.registerCommand("antigravity-acp", {
     description: "Inspect ACP status/account/tools/usage/quota/context/cleanup, manage Antigravity login/logout, configure budgets, toggle debug, refresh models or set tool policies",
@@ -636,8 +655,9 @@ export async function registerOmpAdapter(
         if (changed) void closeStandby();
       },
       setPermissionModeState: mode => {
-        const changed = mode !== permissionMode;
-        permissionMode = mode;
+        const next = mode as AdapterPermissionMode;
+        const changed = next !== permissionPreference;
+        permissionPreference = next;
         if (changed) void closeStandby();
       },
       getLastToolAudit: () => lastToolAudit,
@@ -645,7 +665,8 @@ export async function registerOmpAdapter(
       acquireRuntimeForSession: sessionId => runtimes.acquire(sessionId),
       peekRuntimeForSession: sessionId => runtimes.peek(sessionId),
       getSavedSessionCount: savedSessionCount,
-      getPermissionMode: () => permissionMode,
+      getPermissionMode: effectivePermissionMode,
+      getPermissionPreference: () => permissionPreference,
       getAllRuntimes: () => runtimes.values(),
       closeAllRuntimes: closePool,
       onModelsUpdated: models => {
@@ -684,7 +705,7 @@ export async function registerOmpAdapter(
         streamSimple(
           model: { id: string },
           context: { tools?: OmpToolDeclaration[]; systemPrompt?: string | string[]; messages: unknown[] },
-          options?: { sessionId?: string; reasoning?: string; signal?: AbortSignal; providerSessionState?: Map<string, OmpProviderSessionState> },
+          options?: { sessionId?: string; parentSessionId?: string; reasoning?: string; signal?: AbortSignal; providerSessionState?: Map<string, OmpProviderSessionState> },
         ) {
           const inputTools = toolDeclarations(context.tools ?? []);
           let tools: OmpToolDeclaration[];
@@ -725,6 +746,7 @@ export async function registerOmpAdapter(
           // loading/selecting/listing models performs no ACP process activity.
           const deferred = new PiEventWriter(model);
           const routingId = options?.sessionId;
+          const ownerId = sessionOwnerId(routingId, options?.parentSessionId);
           let replacedOwner: OmpProviderSessionState | undefined;
           const ticket = lifecycle.capture(routingId, options?.providerSessionState,
             previous => { replacedOwner = previous; });
@@ -744,7 +766,7 @@ export async function registerOmpAdapter(
               const original = catalogStore.upstreamModels.get(model.id);
               if (!original) throw new Error(`Antigravity model was not discovered: ${model.id}. Run /antigravity-acp refresh.`);
               await lifecycle.ready(ticket);
-              const lease = runtimes.acquire(routingId);
+              const lease = runtimes.acquire(ownerId);
               const { runtime, provider } = lease.value;
               try {
                 lifecycle.attach(ticket, lease.value);

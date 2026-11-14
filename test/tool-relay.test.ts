@@ -167,3 +167,27 @@ test("the relay control name is reserved from projected user tools", () => {
   assert.equal(projectedMcpName("omp_await_result"), TOOL_RELAY_CONTROL_NAME);
   assert.equal(projectedMcpName("bad name!"), "pi_bad_name_");
 });
+
+test("relayed calls stay awaitable across turn - 1 and cancelAll wakes blocked calls immediately", async () => {
+  const { relay } = relayFor(10_000);
+  const deferred = Promise.withResolvers<CallToolResult>();
+  relay.beginTurn();
+  const pendingCall = relay.call({ id: "call-wake", name: "bash", arguments: { command: "sleep" } }, () => deferred.promise);
+  relay.cancelAll("cancelled early");
+  const cancelledResult = await pendingCall;
+  assert.equal(cancelledResult.isError, true);
+  assert.equal(textOf(cancelledResult), "cancelled early");
+
+  const { clock, relay: relay2 } = relayFor(100);
+  relay2.beginTurn();
+  const deferred2 = Promise.withResolvers<CallToolResult>();
+  const relayedPromise = relay2.call({ id: "call-prev-turn", name: "read", arguments: {} }, () => deferred2.promise);
+  clock.advance(100);
+  await relayedPromise;
+  relay2.beginTurn();
+  deferred2.resolve(result("done in previous turn"));
+  await Promise.resolve();
+  const awaited = await relay2.await("call-prev-turn");
+  assert.equal(awaited.isError, false);
+  assert.equal(textOf(awaited), "done in previous turn");
+});

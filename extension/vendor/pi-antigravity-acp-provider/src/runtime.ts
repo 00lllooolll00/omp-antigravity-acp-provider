@@ -377,6 +377,16 @@ export class AntigravityRuntime {
 		return this.closePromise ??= this.closeBindings();
 	}
 
+	async closeSessionBinding(sessionId: string): Promise<void> {
+		const key = `sid:${sessionId}`;
+		const pending = this.bindings.get(key);
+		if (!pending) return;
+		try {
+			const binding = await pending;
+			await this.invalidateBinding(binding, false);
+		} catch { /* Initialization failed and already cleaned up. */ }
+	}
+
 	private async closeBindings(): Promise<void> {
 		this.bindingEpoch += 1;
 		const pending = [...this.bindings.values()];
@@ -884,9 +894,9 @@ export class AntigravityRuntime {
 		}
 	}
 
-	private async invalidateBinding(binding: Binding): Promise<void> {
+	private async invalidateBinding(binding: Binding, removeSaved = true): Promise<void> {
 		if (binding.turnCompletion) abortTurn(binding);
-		await this.dropBinding(binding.key, binding, true);
+		await this.dropBinding(binding.key, binding, removeSaved);
 	}
 
 	private createConnection(options: AntigravityConnectionOptions): AntigravityAcpConnection {

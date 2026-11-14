@@ -867,48 +867,6 @@ const result = await build({
         contents = `import { classifyAcpFailure } from ${JSON.stringify(path.join(root, "extension/acp-errors.ts"))};\n` + contents;
         return { contents, loader: "ts" };
       });
-      builder.onLoad({ filter: /\/src\/mcp\/bridge\.ts$/ }, async ({ path: file }) => {
-        if (file !== path.join(upstream, "src/mcp/bridge.ts")) return;
-        let contents = await fs.readFile(file, "utf8");
-        const serverAnchor = "\t\tthis.server.maxConnections = 8;";
-        if (contents.split(serverAnchor).length !== 2) throw new Error("Pinned upstream MCP bridge server seam changed; review compatibility");
-        contents = contents.replace(serverAnchor, `${serverAnchor}\n\t\tthis.server.keepAliveTimeout = 0;\n\t\tthis.server.requestTimeout = 0;\n\t\tthis.server.headersTimeout = 0;`);
-        const anchor = "\treadonly fingerprint: string;\n\treadonly omissions: ToolOmission[] = [];\n\tprivate readonly token = crypto.randomUUID().replaceAll(\"-\", \"\");\n\tprivate readonly tools: BridgeTool[];";
-        if (contents.split(anchor).length !== 2) throw new Error("Pinned upstream MCP bridge seam changed; review compatibility");
-        contents = contents.replace(anchor, "\tfingerprint: string;\n\treadonly omissions: ToolOmission[] = [];\n\tprivate readonly token = crypto.randomUUID().replaceAll(\"-\", \"\");\n\tprivate tools: BridgeTool[];");
-        const ctorAnchor = "\t\tthis.tools = projectTools(options.tools, this.omissions);\n\t\tthis.fingerprint = projectionFingerprint(this.tools, this.omissions);\n\t}";
-        if (contents.split(ctorAnchor).length !== 2) throw new Error("Pinned upstream MCP bridge constructor seam changed; review compatibility");
-        contents = contents.replace(ctorAnchor, `${ctorAnchor}\n\n\tupdateTools(tools: readonly Tool[]): void {\n\t\tthis.omissions.length = 0;\n\t\tthis.tools = projectTools(tools, this.omissions);\n\t\tthis.fingerprint = projectionFingerprint(this.tools, this.omissions);\n\t}`);
-        const responsesAnchor = "\tprivate server: ReturnType<typeof createServer> | undefined;\n\tprivate url: string | undefined;";
-        if (contents.split(responsesAnchor).length !== 2) throw new Error("Pinned upstream MCP bridge response seam changed; review compatibility");
-        contents = contents.replace(responsesAnchor, responsesAnchor + "\n\tprivate readonly responses = new Set<ServerResponse>();");
-        const closeAnchor = "\tasync close(): Promise<void> {\n\t\tconst server = this.server;\n\t\tthis.server = undefined;\n\t\tthis.url = undefined;\n\t\tif (!server) return;\n\t\tawait new Promise<void>((resolve) => server.close(() => resolve()));\n\t}";
-        if (contents.split(closeAnchor).length !== 2) throw new Error("Pinned upstream MCP bridge close seam changed; review compatibility");
-        contents = contents.replace(closeAnchor, "\tasync close(): Promise<void> {\n\t\tconst server = this.server;\n\t\tthis.server = undefined;\n\t\tthis.url = undefined;\n\t\tif (!server) return;\n\t\tconst closing = new Promise<void>((resolve) => server.close(() => resolve()));\n\t\tfor (const response of this.responses) response.destroy();\n\t\tthis.responses.clear();\n\t\tserver.closeAllConnections();\n\t\tawait closing;\n\t}");
-        const handleAnchor = "\tprivate async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {\n\t\tif (request.url !== \"/mcp\" || request.method !== \"POST\") {";
-        if (contents.split(handleAnchor).length !== 2) throw new Error("Pinned upstream MCP bridge handle seam changed; review compatibility");
-        contents = contents.replace(handleAnchor, "\tprivate async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {\n\t\tthis.responses.add(response);\n\t\tresponse.once(\"close\", () => this.responses.delete(response));\n\t\tif (request.url !== \"/mcp\" || request.method !== \"POST\") {");
-        const callAnchor = "\t\t\tconst args = call.params.arguments ?? {};\n\t\t\ttry {\n\t\t\t\tif (!Value.Check(tool.originalSchema, args)) {\n\t\t\t\t\treturn toolError(\"Arguments failed the original Pi tool schema\");\n\t\t\t\t}\n\t\t\t} catch {\n\t\t\t\treturn toolError(\"The original Pi tool schema could not validate these arguments\");\n\t\t\t}\n\t\t\treturn this.options.onCall({ id: crypto.randomUUID(), name: tool.piName, arguments: args });";
-        if (contents.split(callAnchor).length !== 2) throw new Error("Pinned upstream MCP bridge tool call seam changed; review compatibility");
-        contents = contents.replace(callAnchor, [
-          "\t\t\tconst args = call.params.arguments ?? {};",
-          "\t\t\tconst normalized = normalizeToolArguments(tool.originalSchema, args);",
-          "\t\t\tconst missing = inspectToolArguments(tool.originalSchema, normalized.arguments).missing;",
-          "\t\t\tlet ompValidated = true;",
-          "\t\t\ttry {",
-          "\t\t\t\tif (!Value.Check(tool.originalSchema, normalized.arguments)) ompValidated = false;",
-          "\t\t\t} catch {",
-          "\t\t\t\treturn toolError(tool.mcpName + \": the original Pi tool schema could not validate these arguments. Expected signature: \" + renderToolSignature(tool.mcpName, tool.originalSchema) + \". Correct the parameters and retry without repeating the same call.\");",
-          "\t\t\t}",
-          "\t\t\tif (!ompValidated || missing.length > 0) {",
-          "\t\t\t\tconst ompMissing = missing.length > 0 ? \"missing required \" + missing.join(\", \") + \". \" : \"\";",
-          "\t\t\t\treturn toolError(tool.mcpName + \": \" + ompMissing + \"Expected signature: \" + renderToolSignature(tool.mcpName, tool.originalSchema) + \". Correct the parameters and retry without repeating the same call.\");",
-          "\t\t\t}",
-          "\t\t\treturn this.options.onCall({ id: crypto.randomUUID(), name: tool.piName, arguments: normalized.arguments });",
-        ].join("\n"));
-        contents = `import { inspectToolArguments, normalizeToolArguments, renderToolSignature } from ${JSON.stringify(path.join(root, "extension/tool-args.ts"))};\n` + contents;
-        return { contents, loader: "ts" };
-      });
       builder.onLoad({ filter: /\/src\/acp\/connection\.ts$/ }, async ({ path: file }) => {
         if (file !== path.join(upstream, "src/acp/connection.ts")) return;
         let contents = await fs.readFile(file, "utf8");
@@ -929,10 +887,6 @@ const result = await build({
         if (contents.split(detailAnchor).length !== 2) throw new Error("Pinned upstream structured error detail seam changed; review compatibility");
         contents = contents.replace(detailAnchor,
           "const record = data as { details?: unknown; message?: unknown };\n\tconst detail = record.details ?? record.message;");
-        const capabilitiesAnchor = "\t\t\t\tclientCapabilities: {\n\t\t\t\t\tfs: { readTextFile: false, writeTextFile: false },\n\t\t\t\t\tterminal: false,\n\t\t\t\t},";
-        if (contents.split(capabilitiesAnchor).length !== 2) throw new Error("Pinned ACP client capability seam changed; review compatibility");
-        contents = contents.replace(capabilitiesAnchor,
-          "\t\t\t\tclientCapabilities: {\n\t\t\t\t\tfs: { readTextFile: false, writeTextFile: false },\n\t\t\t\t\tterminal: false,\n\t\t\t\t\tsession: { compaction: {} },\n\t\t\t\t},");
         return { contents, loader: "ts" };
       });
       builder.onResolve({ filter: /^\.\/assets\/zip-archive\.mjs$/ }, () => ({

@@ -113,4 +113,11 @@ test("offline fallback exposes Hydrogen and Argon before discovery", () => {
   assert.deepEqual(byId.get("gemini-4-hydrogen")?.thinking?.efforts, ["low", "medium", "high", "xhigh"]);
   assert.equal(selectRuntimeModel(byId.get("gemini-4-hydrogen")!, "xhigh").thinkingLevelMap.high, "gemini-4-hydrogen-xhigh");
   assert.deepEqual(byId.get("gemini-4-argon")?.thinking?.efforts, ["low", "medium", "high"]);
+  assert.ok(byId.has("claude-sonnet-5-5"));
+  assert.ok(byId.has("claude-opus-5-5"));
+  assert.ok(byId.has("gpt-oss-120b"));
+  assert.equal(byId.get("claude-sonnet-5-5")?.contextWindow, 1_000_000);
+  assert.equal(byId.get("claude-sonnet-5-5")?.maxTokens, 64_000);
+  assert.equal(byId.get("gpt-oss-120b")?.contextWindow, 131_072);
+  assert.equal(byId.get("gpt-oss-120b")?.maxTokens, 65_536);
 });

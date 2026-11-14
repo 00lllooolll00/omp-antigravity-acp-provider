@@ -28,3 +28,14 @@ test("missing token counts do not invent billable usage", () => {
   applyApiCostEstimate("unknown-model", unknown);
   assert.equal("cost" in unknown, false);
 });
+
+test("partner models, Hydrogen and models/ prefixes resolve exact API list prices with cacheWrite", () => {
+  assert.deepEqual(officialApiCost("models/gemini-4-hydrogen-high"), { input: 1.5, output: 7.5, cacheRead: 0.075, cacheWrite: 0 });
+  assert.deepEqual(officialApiCost("claude-opus-5-5-max"), { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 });
+  assert.deepEqual(officialApiCost("claude-sonnet-5-5"), { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 });
+  assert.deepEqual(officialApiCost("gpt-oss-120b"), { input: 0.15, output: 0.6, cacheRead: 0.075, cacheWrite: 0 });
+  assert.deepEqual(officialApiCost("gemini-pro-orchestrator-g1-pro"), { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 0 });
+  const usage: any = { input: 1_000_000, output: 500_000, cacheRead: 1_000_000, cacheWrite: 1_000_000 };
+  applyApiCostEstimate("claude-sonnet-5-5", usage);
+  assert.deepEqual(usage.cost, { input: 2, output: 5, cacheRead: 0.1, cacheWrite: 2.5, total: 9.6 });
+});

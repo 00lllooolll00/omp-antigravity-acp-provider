@@ -1,4 +1,5 @@
-import { describeCredentialStorage, savePermissionMode } from "./runtime.mjs";
+import { describeCredentialStorage } from "./runtime.mjs";
+import { saveAdapterPermissionMode, type AdapterPermissionMode } from "./adapter-config.ts";
 import { formatLogoutSummary, inspectAcpAuth, keychain, ompCredentialSummary, resolveAntigravityAccountEmail, type OmpAuthCoordinator, type OmpCommandContext } from "./auth-sync.ts";
 import { parseNativeToolMode, type NativeToolMode } from "./tool-routing.ts";
 import { saveToolPolicy, type ToolPolicy } from "./tool-policy.ts";
@@ -43,6 +44,7 @@ export interface RuntimeBundleView {
     setPermissionMode: (mode: string) => Promise<void>;
     logout: () => Promise<void>;
     close: () => Promise<void>;
+    closeSessionBinding?: (sessionId: string) => Promise<void>;
     getPermission: (requestId: string) => { id: string; title: string; options: Array<{ id?: string; label: string }> } | undefined;
     sessionStore?: { read: () => unknown[]; clear: () => void };
   };
@@ -90,6 +92,7 @@ export interface CommandControllerDeps {
   peekRuntimeForSession: (sessionId?: string) => RuntimeBundleView | undefined;
   getSavedSessionCount: () => number;
   getPermissionMode: () => string;
+  getPermissionPreference?: () => string;
   getAllRuntimes: () => RuntimeBundleView[];
   closeAllRuntimes: () => Promise<void>;
   onModelsUpdated: (models: ConfiguredCatalogModel[]) => void;
@@ -182,11 +185,12 @@ const SUBCOMMANDS: SubcommandSpec[] = [
   {
     name: "permissions",
     description: "Requested ACP permission mode",
-    usage: "default|auto-edit|yolo",
+    usage: "default|auto-edit|yolo|follow",
     values: [
       ["default", "Confirm edits and commands"],
       ["auto-edit", "Auto-accept edits"],
       ["yolo", "Auto-accept everything"],
+      ["follow", "Follow OMP tools.approvalMode"],
     ],
   },
   { name: "refresh", description: "Discover and cache advertised models" },
@@ -524,7 +528,10 @@ export function createAntigravityCommandHandler(deps: CommandControllerDeps) {
       // when a runtime for this session already exists.
       const bundle = deps.peekRuntimeForSession(sessionIdOf(ctx));
       const snapshot = await bundle?.runtime.snapshot();
+      const permissionPreference = deps.getPermissionPreference?.() ?? deps.getPermissionMode();
       const permissionMode = deps.getPermissionMode();
+      const permissionLabel = permissionMode === "auto_edit" ? "auto-edit" : permissionMode;
+      const permissionDisplay = permissionPreference === "follow" ? `${permissionLabel} (follow OMP)` : permissionLabel;
       const omp = ompCredentialSummary(ctx);
       const accountEmail = await resolveAntigravityAccountEmail();
       const marker = omp.present === undefined ? "unknown; host did not expose the credential store"
@@ -537,7 +544,7 @@ export function createAntigravityCommandHandler(deps: CommandControllerDeps) {
         ["OMP login marker", marker],
         ["OMP auth source", ompSource],
         ["Saved ACP sessions", deps.getSavedSessionCount()],
-        ["Permission", permissionMode === "auto_edit" ? "auto-edit" : permissionMode],
+        ["Permission", permissionDisplay],
         ["Active sessions", snapshot?.bindings ?? 0],
         ["Token ownership", "Google OAuth tokens stay in Antigravity-owned storage; OMP stores only a non-secret marker."],
         ["Logout", "/antigravity-acp logout clears both sides; OMP /logout also finishes Antigravity-side cleanup."],
@@ -610,12 +617,13 @@ export function createAntigravityCommandHandler(deps: CommandControllerDeps) {
     }
 
     if (command === "permissions") {
-      if (!value || !["default", "auto-edit", "yolo"].includes(value) || parts.length > 2) {
-        throw new Error("Usage: /antigravity-acp permissions default|auto-edit|yolo");
+      if (!value || !["default", "auto-edit", "yolo", "follow"].includes(value) || parts.length > 2) {
+        throw new Error("Usage: /antigravity-acp permissions default|auto-edit|yolo|follow");
       }
-      const mode = value.replace("-", "_");
-      if (mode !== deps.getPermissionMode()) {
-        savePermissionMode(mode, deps.configPath);
+      const mode = value.replace("-", "_") as AdapterPermissionMode;
+      const currentPreference = deps.getPermissionPreference?.() ?? deps.getPermissionMode();
+      if (mode !== currentPreference) {
+        saveAdapterPermissionMode(mode, deps.configPath);
         deps.setPermissionModeState(mode);
         await deps.closeAllRuntimes();
       }
@@ -660,8 +668,10 @@ export function createAntigravityCommandHandler(deps: CommandControllerDeps) {
       }
 
       const policy = deps.getToolPolicy();
+      const requestedPreference = deps.getPermissionPreference?.() ?? deps.getPermissionMode();
       const requestedPermission = deps.getPermissionMode();
       const requestedLabel = requestedPermission === "auto_edit" ? "auto-edit" : requestedPermission;
+      const requestedDisplay = requestedPreference === "follow" ? `${requestedLabel} (follow OMP)` : requestedLabel;
       const wireLabel = snapshot.permissionMode === "auto_edit" ? "auto-edit" : snapshot.permissionMode;
       const authHealth = await inspectAcpAuth();
       const authenticated = authHealth.status === "api-key-env" || authHealth.status === "oauth-refreshable" || (await keychain.present()) === true;
@@ -674,7 +684,7 @@ export function createAntigravityCommandHandler(deps: CommandControllerDeps) {
         ["Login", authenticated ? "ready" : `not ready · ${authHealth.status}`],
         ["Runtime", versions.join(", ") || undefined],
         ["Native channel", channels.join(", ") || undefined],
-        ["Permission", requestedLabel === wireLabel ? requestedLabel : `requested ${requestedLabel} → wire ${wireLabel}`],
+        ["Permission", requestedLabel === wireLabel ? requestedDisplay : `requested ${requestedDisplay} → wire ${wireLabel}`],
         ["Native tools", policy.nativeTools],
         ["Tool debug", policy.debugToolUpdates ? "on" : undefined],
         ["Thinking", thinking.map(value => `${value.model}=${value.effort}`).join(", ") || undefined],

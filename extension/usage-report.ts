@@ -164,6 +164,11 @@ export function createAntigravityUsageProvider(deps: {
   getAccountEmail: () => string | undefined | Promise<string | undefined>;
 }): OmpUsageProvider {
   const providerId = deps.providerId ?? "antigravity-acp";
+  let inFlight: {
+    controller: AbortController;
+    subscribers: number;
+    promise: Promise<OmpUsageReport | null>;
+  } | undefined;
   return {
     id: providerId,
     cacheVersion: 1,
@@ -172,17 +177,59 @@ export function createAntigravityUsageProvider(deps: {
       if (params.signal?.aborted) return null;
       if (!(await deps.authReady())) return null;
       if (params.signal?.aborted) return null;
-      try {
-        const snapshot = await deps.fetchQuota(params.signal);
-        return quotaSnapshotToUsageReport(snapshot, {
-          provider: providerId,
-          email: (await deps.getAccountEmail()) ?? params.credential.email,
-          accountId: params.credential.accountId,
-        });
-      } catch (error) {
-        if (params.signal?.aborted) return null;
-        throw error;
+      let shared = inFlight;
+      if (!shared) {
+        const controller = new AbortController();
+        const load = (async () => {
+          try {
+            const snapshot = await deps.fetchQuota(controller.signal);
+            if (controller.signal.aborted) return null;
+            return quotaSnapshotToUsageReport(snapshot, {
+              provider: providerId,
+              email: (await deps.getAccountEmail()) ?? params.credential.email,
+              accountId: params.credential.accountId,
+            });
+          } catch (error) {
+            if (controller.signal.aborted) return null;
+            throw error;
+          } finally {
+            if (inFlight?.promise === load) inFlight = undefined;
+          }
+        })();
+        shared = { controller, subscribers: 0, promise: load };
+        inFlight = shared;
       }
+      shared.subscribers++;
+      const outcome = Promise.withResolvers<OmpUsageReport | null>();
+      let subscribed = true;
+      const detach = () => {
+        if (!subscribed) return;
+        subscribed = false;
+        shared.subscribers--;
+        params.signal?.removeEventListener("abort", onAbort);
+        if (shared.subscribers !== 0) return;
+        if (inFlight?.promise === shared.promise) inFlight = undefined;
+        shared.controller.abort();
+      };
+      const onAbort = () => {
+        detach();
+        outcome.resolve(null);
+      };
+      shared.promise.then(
+        report => {
+          detach();
+          outcome.resolve(report);
+        },
+        error => {
+          const aborted = shared.controller.signal.aborted || params.signal?.aborted;
+          detach();
+          if (aborted) outcome.resolve(null);
+          else outcome.reject(error);
+        },
+      );
+      params.signal?.addEventListener("abort", onAbort, { once: true });
+      if (params.signal?.aborted) onAbort();
+      return outcome.promise;
     },
   };
 }
