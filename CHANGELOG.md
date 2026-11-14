@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1 — 2026-11-14
+
+- 修复 `follow` 权限模式把「OMP 未配置 `tools.approvalMode`」误判为 ACP `default` 的问题。OMP 自身设置层把 `tools.approvalMode` 默认为 `yolo`，因此未显式配置时应跟随为 `yolo`；此前 0.2.0 会退化成逐次询问，导致每次 `mcp_pi-bridge_*` 桥接工具调用都弹出 Allow/Deny（例如 `pi_read`）。现在 `always-ask` / `always-ask-cached` → `default`、`write` → `auto_edit`、`yolo` 或未配置 → `yolo`。
+
 ## 0.2.0 — 2026-11-14
 
 - 隔离 `agy acp` 全局 MCP 配置：通过 `--gemini-dir` 配合 `antigravity-acp` 软链接默认隔离 `~/.gemini/config/mcp_config.json`（保留 `OMP_ACP_INCLUDE_DEFAULT_CUSTOMIZATIONS=1` 还原开关），避免多开重复 MCP 进程，同时完整保留凭据、会话与清理路径；并在 `TOOL_ROUTING` 补充 `xd://mcp__*` 经由 `pi_read` / `pi_write` 的调用指引。
