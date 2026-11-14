@@ -36,3 +36,13 @@ test("built quota probe waits for /usage and spares an in-flight OAuth refresh",
   assert.match(text, /setTimeout\(resolve, (?:1500|1\.5e3)\)/,
     "closing the probe process must wait a grace period so its token refresh can finish");
 });
+
+test("built quota probe isolates session cwd outside the project directory", { skip: !built }, () => {
+  const text = fs.readFileSync(bundle, "utf8");
+  assert.match(text, /const quotaCwd = join\(tmpdir\(\), "omp-antigravity-acp-quota"\);/,
+    "quota probe must use a dedicated temporary directory as its cwd");
+  assert.match(text, /const quotaOptions = \{ cwd: quotaCwd, ompPurpose: "quota" \};/,
+    "quota probe connection must spawn in quotaCwd rather than process.cwd()");
+  assert.match(text, /await connection\.newSession\(quotaCwd, signal\);/,
+    "quota probe session/new must use quotaCwd so upstream runtime files are not materialized in the workspace");
+});
