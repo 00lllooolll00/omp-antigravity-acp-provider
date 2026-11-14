@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.50 — 2026-11-14
+
+- Isolate `ompFetchQuota` (`runtime.quota()`) in a dedicated temporary directory (`os.tmpdir()/omp-antigravity-acp-quota`) instead of `process.cwd()`. Opening OMP in a project workspace triggers an automatic `/usage` quota lookup, and `agy-acp-server` 1.5.0+ materializes built-in system skills (`skills/system/run-workflow/SKILL.md`) into the ACP session's `cwd`; moving the quota probe outside the workspace stops OMP startup from creating `skills/` directories in project folders before any prompt is sent.
+- Add a built-runtime regression asserting that `ompFetchQuota` creates and passes the isolated temporary directory to both the spawned connection and `connection.newSession()`.
+
 ## 0.1.49 — 2026-11-13
 
 - Stop cancelling the ACP server's OAuth token refresh. The quota probe used to wait only 5 s for `/usage` and then kill the child, which aborted the refresh the server had just started, marked the saved token invalid, and left the next launch asking for a browser sign-in. The probe now waits 20 s and gives a 1.5 s grace before tearing the process down, so an expired access token can be renewed with the stored refresh token instead of forcing a new login.
