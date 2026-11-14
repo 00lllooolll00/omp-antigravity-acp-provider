@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.51 — 2026-11-14
+
+- Guard MCP tool calls with unambiguous schema alias mapping (`extension/tool-args.ts`, `scripts/build.mjs`) and return actionable errors combining missing required keys with the expected tool signature instead of a generic schema failure.
+- Ensure loopback hosts are appended to `NO_PROXY` / `no_proxy` when proxy variables are active (`extension/proxy-env.ts`, `extension/index.ts`) so local MCP bridge traffic never routes through an external proxy.
+- Redact OAuth material (authorization URLs, sensitive query values, bearer tokens, `code_challenge` / `access_token` pairs) from classified ACP failure messages (`extension/redact.ts`, `extension/acp-errors.ts`) while preserving diagnostics such as `exit code=1`.
+
 ## 0.1.50 — 2026-11-14
 
 - Isolate `ompFetchQuota` (`runtime.quota()`) in a dedicated temporary directory (`os.tmpdir()/omp-antigravity-acp-quota`) instead of `process.cwd()`. Opening OMP in a project workspace triggers an automatic `/usage` quota lookup, and `agy-acp-server` 1.5.0+ materializes built-in system skills (`skills/system/run-workflow/SKILL.md`) into the ACP session's `cwd`; moving the quota probe outside the workspace stops OMP startup from creating `skills/` directories in project folders before any prompt is sent.
