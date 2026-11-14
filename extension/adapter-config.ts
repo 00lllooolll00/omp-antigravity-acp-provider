@@ -209,8 +209,13 @@ export function resolveAdapterPermissionMode(
 ): EffectivePermissionMode {
   if (preference !== "follow") return preference;
   switch (readOmpApprovalMode(agentDir, cwd)) {
-    case "yolo": return "yolo";
+    case "always-ask":
+    case "always-ask-cached": return "default";
     case "write": return "auto_edit";
-    default: return "default";
+    case "yolo": return "yolo";
+    // OMP's own settings layer defaults tools.approvalMode to "yolo", so an
+    // absent key means OMP auto-approves. Falling back to "default" here would
+    // diverge from "follow OMP" and prompt for every bridged MCP tool call.
+    default: return "yolo";
   }
 }

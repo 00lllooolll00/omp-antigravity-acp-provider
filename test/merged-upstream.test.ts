@@ -40,6 +40,9 @@ test("adapter-config defaults to follow, validates patches before writing and re
     assert.throws(() => updateAdapterConfig(configPath, { nativeTools: "invalid" as any }), /nativeTools/);
     assert.equal(fs.existsSync(configPath), false);
 
+    // OMP defaults tools.approvalMode to yolo, so follow must not start asking.
+    assert.equal(resolveAdapterPermissionMode("follow", agentDir, projectDir), "yolo");
+    fs.writeFileSync(path.join(agentDir, "config.yml"), "tools:\n  approvalMode: always-ask\n");
     assert.equal(resolveAdapterPermissionMode("follow", agentDir, projectDir), "default");
     fs.writeFileSync(path.join(agentDir, "config.yml"), "tools:\n  approvalMode: write\n");
     assert.equal(readOmpApprovalMode(agentDir, projectDir, ["node", "omp"]), "write");
