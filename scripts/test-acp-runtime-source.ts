@@ -93,8 +93,12 @@ function freshEnv(): NodeJS.ProcessEnv {
     const argv = fs.readFileSync(argvRecord, "utf8").trimEnd().split("\n");
     assert.equal(argv.filter(value => value === "--dangerously-skip-permissions").length, marker === "1" ? 1 : 0,
       `dangerous flag count with marker ${JSON.stringify(marker)}`);
+    assert.equal(argv.filter(value => value === "--include-default-customizations=false").length, 1);
+    assert.equal(argv.filter(value => value === `--gemini-dir=${path.join(stateDir, "agy-gemini")}`).length, 1);
     assert.deepEqual(argv.slice(0, 2), ["acp", "--app_data_dir=antigravity-acp"]);
     assert.equal(argv.at(-1), "--fixture-argument");
+    assert.equal(fs.existsSync(path.join(stateDir, "agy-gemini", "config", ".migrated")), true);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(stateDir, "agy-gemini", "config", "mcp_config.json"), "utf8")), { mcpServers: {} });
   }
   assert.doesNotThrow(() => assertSelectedAcpCliLaunch(stateDir, preference, env));
   assert.throws(() => assertSelectedAcpCliLaunch(stateDir, preference, { ...env, AGY_ACP_BIN: "/usr/bin/false" }), /not selected by AGY_ACP_BIN/);
@@ -241,6 +245,109 @@ for (const script of ["exit 1", "echo prerelease"]) {
   assert.equal(custom, "custom");
   assert.equal(installCalls, 1);
   assert.equal(env.AGY_ACP_BIN, "/opt/custom-quota-bin");
+}
+
+// Default isolation isolates ~/.gemini/config/mcp_config.json while preserving
+// antigravity-acp state via symlink, supports GEMINI_HOME & spaces, honors explicit
+// --gemini-dir or OMP_ACP_INCLUDE_DEFAULT_CUSTOMIZATIONS, and refreshes stale wrappers.
+{
+  const isoRoot = path.join(work, "iso space");
+  const isoState = path.join(isoRoot, "state dir");
+  const isoHome = path.join(isoRoot, "home dir");
+  const realAcp = path.join(isoHome, ".gemini", "antigravity-acp");
+  const argvRecord = path.join(isoRoot, "argv.txt");
+  fs.mkdirSync(realAcp, { recursive: true });
+  fs.writeFileSync(path.join(realAcp, "acp_token.json"), JSON.stringify({ marker: "keep-auth" }));
+  fs.mkdirSync(path.join(isoHome, ".gemini", "config"), { recursive: true });
+  fs.writeFileSync(path.join(isoHome, ".gemini", "config", "mcp_config.json"), JSON.stringify({ mcpServers: { codegraph: { command: "true" } } }));
+  stubAgy(`if [ "$1" = "acp" ] && [ "$2" = "--version" ]; then\n  echo 9.9.9\n  exit 0\nfi\nprintf '%s\\n' "$@" > '${argvRecord}'`);
+  setManagedVersion("1.4.5");
+
+  // Pre-seed a stale wrapper without --gemini-dir plus matching cliStamp to prove in-place refresh.
+  fs.mkdirSync(isoState, { recursive: true });
+  const preEnv = freshEnv();
+  const first = await preferNewestAcpRuntime(isoState, preEnv, home);
+  const wrapper = path.join(isoState, "agy-acp-cli.sh");
+  fs.writeFileSync(wrapper, "#!/bin/sh\nexec 'old' acp --include-default-customizations=false \"$@\"\n", { mode: 0o755 });
+  const refreshEnv = freshEnv();
+  const refreshed = await preferNewestAcpRuntime(isoState, refreshEnv, home);
+  assert.equal(refreshed.cliStamp, first.cliStamp);
+  assert.doesNotThrow(() => assertSelectedAcpCliLaunch(isoState, refreshed, refreshEnv));
+  assert.ok(fs.readFileSync(wrapper, "utf8").includes("--gemini-dir="));
+
+  // Default run with spaces in HOME and stateDir.
+  const childEnv = { ...freshEnv(), HOME: isoHome };
+  fs.rmSync(argvRecord, { force: true });
+  let res = spawnSync(wrapper, ["--fixture-arg"], { env: childEnv, encoding: "utf8" });
+  assert.equal(res.status, 0, res.stderr);
+  const isolatedDir = path.join(isoState, "agy-gemini");
+  let argv = fs.readFileSync(argvRecord, "utf8").trimEnd().split("\n");
+  assert.ok(argv.includes(`--gemini-dir=${isolatedDir}`));
+  assert.ok(argv.includes("--include-default-customizations=false"));
+  assert.equal(argv.at(-1), "--fixture-arg");
+  assert.equal(fs.lstatSync(path.join(isolatedDir, "antigravity-acp")).isSymbolicLink(), true);
+  assert.equal(fs.realpathSync(path.join(isolatedDir, "antigravity-acp")), fs.realpathSync(realAcp));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(isolatedDir, "antigravity-acp", "acp_token.json"), "utf8")).marker, "keep-auth");
+  assert.equal(fs.existsSync(path.join(isolatedDir, "config", ".migrated")), true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(isolatedDir, "config", "mcp_config.json"), "utf8")), { mcpServers: {} });
+
+  // Tampering with isolated mcp_config.json is healed on next launch.
+  fs.writeFileSync(path.join(isolatedDir, "config", "mcp_config.json"), '{"mcpServers":{"stale":{}}}');
+  res = spawnSync(wrapper, ["--fixture-arg"], { env: childEnv, encoding: "utf8" });
+  assert.equal(res.status, 0, res.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(isolatedDir, "config", "mcp_config.json"), "utf8")), { mcpServers: {} });
+
+  // GEMINI_HOME with leading/trailing spaces and ~/ updates the symlink target.
+  const tildeEnv = { ...childEnv, GEMINI_HOME: "  ~/custom gemini  " };
+  res = spawnSync(wrapper, ["--fixture-arg"], { env: tildeEnv, encoding: "utf8" });
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(fs.realpathSync(path.join(isolatedDir, "antigravity-acp")),
+    fs.realpathSync(path.join(isoHome, "custom gemini", "antigravity-acp")));
+
+  // GEMINI_HOME switching to an absolute path updates the symlink again.
+  const absGemini = path.join(isoRoot, "abs gemini");
+  res = spawnSync(wrapper, ["--fixture-arg"], { env: { ...childEnv, GEMINI_HOME: absGemini }, encoding: "utf8" });
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(fs.realpathSync(path.join(isolatedDir, "antigravity-acp")),
+    fs.realpathSync(path.join(absGemini, "antigravity-acp")));
+
+  // Explicit --gemini-dir / --gemini_dir from caller is preserved without adding another.
+  for (const explicit of ["--gemini-dir=/tmp/explicit-a", "--gemini_dir=/tmp/explicit-b"]) {
+    fs.rmSync(argvRecord, { force: true });
+    res = spawnSync(wrapper, [explicit], { env: childEnv, encoding: "utf8" });
+    assert.equal(res.status, 0, res.stderr);
+    argv = fs.readFileSync(argvRecord, "utf8").trimEnd().split("\n");
+    assert.equal(argv.filter(value => value.startsWith("--gemini-dir") || value.startsWith("--gemini_dir")).length, 1);
+    assert.ok(argv.includes(explicit));
+    assert.ok(argv.includes("--include-default-customizations=false"));
+  }
+
+  // OMP_ACP_INCLUDE_DEFAULT_CUSTOMIZATIONS=1 or true restores unmodified CLI behavior.
+  for (const optIn of ["1", "true"]) {
+    fs.rmSync(argvRecord, { force: true });
+    res = spawnSync(wrapper, ["--fixture-arg"], {
+      env: { ...childEnv, OMP_ACP_INCLUDE_DEFAULT_CUSTOMIZATIONS: optIn },
+      encoding: "utf8",
+    });
+    assert.equal(res.status, 0, res.stderr);
+    argv = fs.readFileSync(argvRecord, "utf8").trimEnd().split("\n");
+    assert.equal(argv.some(value => value.startsWith("--gemini-dir")), false);
+    assert.equal(argv.includes("--include-default-customizations=false"), false);
+    assert.deepEqual(argv, ["acp", "--app_data_dir=antigravity-acp", "--fixture-arg"]);
+  }
+
+  // Non-opt-in values ("0", "") still keep isolation active.
+  for (const keepIso of ["0", ""]) {
+    fs.rmSync(argvRecord, { force: true });
+    res = spawnSync(wrapper, ["--fixture-arg"], {
+      env: { ...childEnv, OMP_ACP_INCLUDE_DEFAULT_CUSTOMIZATIONS: keepIso },
+      encoding: "utf8",
+    });
+    assert.equal(res.status, 0, res.stderr);
+    argv = fs.readFileSync(argvRecord, "utf8").trimEnd().split("\n");
+    assert.ok(argv.includes(`--gemini-dir=${isolatedDir}`));
+    assert.ok(argv.includes("--include-default-customizations=false"));
+  }
 }
 
 fs.rmSync(work, { recursive: true, force: true });

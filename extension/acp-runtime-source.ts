@@ -279,7 +279,67 @@ function cliWrapperScript(agyPath: string): string {
   // --app_data_dir=antigravity-acp is the managed .par's own default: the CLI
   // binary would otherwise default to antigravity-cli, mixing ACP sessions
   // with personal CLI chats outside session cleanup's tracked tree.
-  return `#!/bin/sh\nif [ -n "\${OMP_ACP_DANGEROUSLY_SKIP_PERMISSIONS:-}" ]; then\n  set -- --dangerously-skip-permissions "$@"\nfi\nexec '${agyPath.replace(/'/g, "'\\''")}' acp --app_data_dir=antigravity-acp "$@"\n`;
+  // Passing --include-default-customizations=false alone does not stop agy from
+  // reading ~/.gemini/config/mcp_config.json, so isolate via --gemini-dir
+  // under the wrapper's state directory while keeping antigravity-acp
+  // symlinked to the active real base so auth, sessions, and cleanup stay intact.
+  const quotedAgy = agyPath.replace(/'/g, "'\\''");
+  return `#!/bin/sh
+if [ -n "\${OMP_ACP_DANGEROUSLY_SKIP_PERMISSIONS:-}" ]; then
+  set -- --dangerously-skip-permissions "$@"
+fi
+if [ "\${OMP_ACP_INCLUDE_DEFAULT_CUSTOMIZATIONS:-}" != "1" ] && [ "\${OMP_ACP_INCLUDE_DEFAULT_CUSTOMIZATIONS:-}" != "true" ]; then
+  has_gemini_dir=0
+  for arg in "$@"; do
+    case "$arg" in
+      "--gemini-dir"|"--gemini-dir="*|"--gemini_dir"|"--gemini_dir="*)
+        has_gemini_dir=1
+        break
+        ;;
+    esac
+  done
+  if [ "$has_gemini_dir" -eq 0 ] && wrapper_dir=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd); then
+    isolated_gemini="$wrapper_dir/agy-gemini"
+    mkdir -p "$isolated_gemini/config"
+    [ -e "$isolated_gemini/config/.migrated" ] || : > "$isolated_gemini/config/.migrated"
+    mcp_cfg="$isolated_gemini/config/mcp_config.json"
+    if [ ! -f "$mcp_cfg" ] || [ "$(tr -d ' \\n\\r\\t' < "$mcp_cfg" 2>/dev/null || true)" != '{"mcpServers":{}}' ]; then
+      mcp_tmp="$mcp_cfg.$$.tmp"
+      printf '{"mcpServers":{}}\\n' > "$mcp_tmp" && mv -f "$mcp_tmp" "$mcp_cfg"
+    fi
+    gemini_base=""
+    raw_gemini_home=""
+    if [ -n "\${GEMINI_HOME:-}" ]; then
+      raw_gemini_home=$(printf '%s' "\${GEMINI_HOME:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    fi
+    if [ -n "$raw_gemini_home" ]; then
+      case "$raw_gemini_home" in
+        "~") gemini_base="\${HOME:-}" ;;
+        "~"/*) if [ -n "\${HOME:-}" ]; then gemini_base="\${HOME}/\${raw_gemini_home#\\~/}"; fi ;;
+        *) gemini_base="$raw_gemini_home" ;;
+      esac
+    elif [ -n "\${HOME:-}" ]; then
+      gemini_base="\${HOME}/.gemini"
+    fi
+    if [ -n "$gemini_base" ]; then
+      target_acp="$gemini_base/antigravity-acp"
+      mkdir -p "$target_acp"
+      target_acp=$(CDPATH= cd -- "$target_acp" && pwd)
+      link_path="$isolated_gemini/antigravity-acp"
+      current_link=$(readlink "$link_path" 2>/dev/null || true)
+      if [ "$current_link" != "$target_acp" ]; then
+        [ ! -e "$link_path" ] || [ -L "$link_path" ] || rm -rf "$link_path"
+        if ! ln -sfn "$target_acp" "$link_path" 2>/dev/null; then
+          [ "$(readlink "$link_path" 2>/dev/null || true)" = "$target_acp" ] || ln -sfn "$target_acp" "$link_path"
+        fi
+      fi
+    fi
+    set -- "--gemini-dir=$isolated_gemini" "$@"
+  fi
+  set -- --include-default-customizations=false "$@"
+fi
+exec '${quotedAgy}' acp --app_data_dir=antigravity-acp "$@"
+`;
 }
 
 function writeCliWrapper(file: string, agyPath: string): void {

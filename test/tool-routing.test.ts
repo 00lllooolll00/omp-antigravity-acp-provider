@@ -15,6 +15,9 @@ test("routing uses advertised system extension and eagerly loads only the bridge
   const meta = result._meta.antigravity;
   assert.match(meta.systemPrompt.append, /Supplied OMP tools/);
   assert.match(meta.systemPrompt.append, /explicit approval/);
+  assert.match(meta.systemPrompt.append, /xd:\/\/mcp__\*/);
+  assert.match(meta.systemPrompt.append, /pi_read \(schema\)/);
+  assert.match(meta.systemPrompt.append, /pi_write \(JSON arguments\)/);
   assert.deepEqual(meta.eagerMcpServers, ["pi-bridge"]);
   assert.deepEqual(meta.disabledTools, []);
   assert.equal(meta.enabledTools, undefined);

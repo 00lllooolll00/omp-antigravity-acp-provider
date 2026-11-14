@@ -1,7 +1,7 @@
 export type NativeToolMode = "prefer" | "disabled";
 
 export const TOOL_ROUTING =
-  "Supplied OMP tools are exposed by the authenticated pi-bridge MCP server with pi_ prefixes. Call them directly for user tasks. If no OMP tool fits, report the missing capability and obtain explicit approval before using an Antigravity-native tool.";
+  "Supplied OMP tools are exposed by the authenticated pi-bridge MCP server with pi_ prefixes. OMP-mounted MCP routes (xd://mcp__*) are accessed via pi_read (schema) and pi_write (JSON arguments). Call them directly for user tasks. If no OMP tool fits, report the missing capability and obtain explicit approval before using an Antigravity-native tool.";
 
 export function systemRouting(mode: NativeToolMode): string {
   return TOOL_ROUTING + (mode === "disabled"
