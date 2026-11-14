@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.52 — 2026-11-14
+
+- 优化内存与启动体积：裁剪 `zod` 非英文 locale、将 `unzipper` 拆分为按需加载的 `extension/assets/zip-archive.mjs`（`extension/runtime.mjs` 从 2.50 MB 降至 1.79 MB，加载堆占用降低约 1.85 MB），并修复 `bounded-stream.ts` 大帧分片 $O(N^2)$ 拷贝。
+- 降低子进程常驻内存：默认 `OMP_ACP_MAX_IDLE_RUNTIMES` 从 `2` 降至 `1`，切换至非 `antigravity-acp` provider 时立即关闭 `standby` 进程，池中已有活跃连接时跳过冗余预热并为 `standby` 增加默认 5 分钟闲置 TTL；将 `fetchQuotaSnapshot` 剥离为独立按需 `quotaRuntime` 避免挤占会话池槽位。
+- 优化上下文传输与长期驻留：`extension/context-transfer.ts` 采用游标分块与流式零分配 JSON 字节统计，消除 32 MB 超限输入与冷启动重放中的 $O(N^2)$ 切片及大串副本；`TierConnection.compactions` 在终态通知派发后及时清理并限制摘要长度；`OmpAuthCoordinator` 在 `session_shutdown` 释放上下文强引用；`TranscriptRouting.forget()` 清理无余留引用的 owner 路由；`usage-db.ts` 限制 SQLite 页缓存并分批游标读取。
+- 解决多 OMP 实例与重复登录问题：新增基于 `login-in-progress.json` 的跨进程登录协调锁，防止多开实例在 OAuth 授权期间互踢清空 keyring；支持安全提取 Linux Secret Service keyring 中的非秘密账号邮箱，消除 `agent.db` 无标识重复凭据堆积；将 `oauth2.googleapis.com` `EOF` 等网络刷新失败归类为 `transport` 错误并提示检查代理；为 `TierConnection.newSession`/`resumeSession`/`loadSession` 增加启动认证瞬时竞态自动重试。
+
 ## 0.1.51 — 2026-11-14
 
 - Guard MCP tool calls with unambiguous schema alias mapping (`extension/tool-args.ts`, `scripts/build.mjs`) and return actionable errors combining missing required keys with the expected tool signature instead of a generic schema failure.
