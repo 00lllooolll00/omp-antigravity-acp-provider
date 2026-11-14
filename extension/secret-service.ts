@@ -10,16 +10,17 @@ export const SECRET_SERVICE = "gemini";
 export const SECRET_ACCOUNT = "antigravity";
 
 const SECRET_TOOL = "secret-tool";
-const SECRET_TOOL_TIMEOUT_MS = 3_000;
+const SECRET_TOOL_TIMEOUT_MS = 5_000;
 
 export interface SecretService {
   /** true: a non-empty token is stored; false: confirmed absent; undefined:
    * not Linux or the keyring is unreachable (no secret-tool/D-Bus). */
   present: () => Promise<boolean | undefined>;
+  /** Non-secret account email if available in the stored JSON metadata. */
+  accountEmail?: () => Promise<string | undefined>;
   /** true: removed; false: confirmed absent; undefined: not applicable. */
   remove: () => Promise<boolean | undefined>;
 }
-
 // The secret-tool subprocess boundary. stdout is only checked for a non-empty
 // token and is never logged or persisted. Tests inject a stub runner.
 export async function runSecretTool(args: string[], bin = SECRET_TOOL): Promise<string> {
@@ -52,6 +53,27 @@ function isConfirmedMissing(error: unknown): boolean {
   const detail = errorDetail(error);
   return Boolean(detail && detail.killed !== true && detail.signal == null && detail.code === 1 && !isUnavailable(error));
 }
+function validEmail(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(trimmed) ? trimmed : undefined;
+}
+
+function extractEmailFromKeyringPayload(stdout: string): string | undefined {
+  const trimmed = stdout.trim();
+  if (!trimmed.startsWith("{")) return undefined;
+  try {
+    const parsed = JSON.parse(trimmed) as { id_token_email?: unknown; id_token?: unknown } | null;
+    const direct = validEmail(parsed?.id_token_email);
+    if (direct) return direct;
+    const idToken = parsed?.id_token;
+    if (typeof idToken === "string" && idToken.includes(".")) {
+      const claims = JSON.parse(Buffer.from(idToken.split(".")[1]!, "base64url").toString("utf8")) as { email?: unknown };
+      return validEmail(claims?.email);
+    }
+  } catch { /* Non-JSON or malformed payload; ignore without surfacing secrets. */ }
+  return undefined;
+}
 
 export function createSecretService(
   run: (args: string[]) => Promise<string>,
@@ -70,8 +92,15 @@ export function createSecretService(
   };
   return {
     present: () => check(["lookup", ...attributes], "Unable to inspect the Antigravity keyring entry", stdout => stdout.trim().length > 0),
+    accountEmail: async () => {
+      if (platform !== "linux") return undefined;
+      try {
+        return extractEmailFromKeyringPayload(await run(["lookup", ...attributes]));
+      } catch {
+        return undefined;
+      }
+    },
     remove: () => check(["clear", ...attributes], "Unable to remove the Antigravity keyring entry", () => true),
   };
 }
-
 export const secretService = createSecretService(runSecretTool);

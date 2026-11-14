@@ -232,7 +232,7 @@ export class TierConnection extends AntigravityAcpConnection {
   takeCompactionNotices(): AcpCompactionNotice[] {
     const notices: AcpCompactionNotice[] = [];
     for (const [sessionId, records] of this.compactions) {
-      for (const record of records.values()) {
+      for (const [compactionId, record] of records) {
         if (record.notified || !isTerminalCompaction(record.status)) continue;
         record.notified = true;
         notices.push({
@@ -242,7 +242,9 @@ export class TierConnection extends AntigravityAcpConnection {
           summary: record.summary,
           ...(record.error !== undefined ? { error: record.error } : {}),
         });
+        records.delete(compactionId);
       }
+      if (records.size === 0) this.compactions.delete(sessionId);
     }
     return notices;
   }
@@ -267,8 +269,37 @@ export class TierConnection extends AntigravityAcpConnection {
     };
   }
 
+  private async retryStartupAuthRace<T>(signal: AbortSignal | undefined, call: () => Promise<T>): Promise<T> {
+    const started = performance.now();
+    try {
+      return await call();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const isRace = !signal?.aborted
+        && this.process.alive
+        && performance.now() - started < 2_000
+        && /authentication required|auth_required|not logged in|not signed in/i.test(message)
+        && !/invalid_grant|api.?key/i.test(message);
+      if (!isRace) throw error;
+      await new Promise<void>(resolve => {
+        const onAbort = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(() => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
+        }, 250);
+        signal?.addEventListener("abort", onAbort, { once: true });
+        timer.unref?.();
+      });
+      if (signal?.aborted || !this.process.alive) throw error;
+      return await call();
+    }
+  }
+
   override async newSession(...args: Parameters<AntigravityAcpConnection["newSession"]>) {
-    const session = await super.newSession(...args);
+    const session = await this.retryStartupAuthRace(args[1], () => super.newSession(...args));
     if (this.cleanup) {
       try { this.cleanupLeases.set(session.sessionId, await this.cleanup.acquire(session.sessionId, true, this.process.pid!)); }
       catch { this.pendingOwned.add(session.sessionId); console.warn("[ACP cleanup] Registration deferred; preserving session files and retrying."); }
@@ -288,7 +319,7 @@ export class TierConnection extends AntigravityAcpConnection {
   }
   override async resumeSession(...args: Parameters<AntigravityAcpConnection["resumeSession"]>) {
     await this.protectSession(args[0]);
-    const session = await super.resumeSession(...args);
+    const session = await this.retryStartupAuthRace(args[3], () => super.resumeSession(...args));
     if ("availableCommands" in session && Array.isArray(session.availableCommands)) {
       this.updateUsageCommands(args[0], session.availableCommands);
     }
@@ -296,7 +327,7 @@ export class TierConnection extends AntigravityAcpConnection {
   }
   override async loadSession(...args: Parameters<AntigravityAcpConnection["loadSession"]>) {
     await this.protectSession(args[0]);
-    const session = await super.loadSession(...args);
+    const session = await this.retryStartupAuthRace(args[3], () => super.loadSession(...args));
     if ("availableCommands" in session && Array.isArray(session.availableCommands)) {
       this.updateUsageCommands(args[0], session.availableCommands);
     }

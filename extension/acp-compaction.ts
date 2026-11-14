@@ -76,6 +76,8 @@ export function applyCompactionUpdate(
   };
 }
 
+const MAX_COMPACTION_SUMMARY_CHARS = 4096;
+
 export function applyCompactionChunk(
   previous: AcpCompactionRecord | undefined,
   sessionId: string,
@@ -85,11 +87,14 @@ export function applyCompactionChunk(
   if (typeof chunk.compactionId !== "string" || !chunk.compactionId) return previous;
   const text = contentText([chunk.content]);
   if (!text) return previous;
+  const prior = previous?.summary ?? "";
+  const remaining = MAX_COMPACTION_SUMMARY_CHARS - prior.length;
+  const summary = remaining > 0 ? prior + (text.length > remaining ? text.slice(0, remaining) : text) : prior;
   return {
     sessionId,
     compactionId: chunk.compactionId,
     status: previous?.status ?? "in_progress",
-    summary: (previous?.summary ?? "") + text,
+    summary,
     ...(previous?.error !== undefined ? { error: previous.error } : {}),
     updatedAt: now,
     notified: previous?.notified ?? false,

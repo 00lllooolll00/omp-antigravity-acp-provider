@@ -34,6 +34,19 @@ export class SessionRuntimePool<T> {
   peek(sessionId?: string): T | undefined {
     return this.entries.get(sessionId);
   }
+  hasEntries(): boolean {
+    return this.entries.size > 0;
+  }
+
+  acquireExisting(): { value: T; release: () => void } | undefined {
+    let latestKey: string | undefined;
+    let found = false;
+    for (const key of this.entries.keys()) {
+      latestKey = key;
+      found = true;
+    }
+    return found ? this.acquire(latestKey) : undefined;
+  }
   acquire(sessionId?: string) {
     // Establish the lease before enforcing the idle cap: active work must not
     // evict a warm runtime merely by temporarily appearing to be idle.

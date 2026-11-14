@@ -86,7 +86,11 @@ export function resolveContextOptions(model: { id: string; contextWindow: number
 
 // Lightweight estimate, not a Gemini tokenizer. Do not download tokenizers or
 // confuse payload bytes with tokens. Non-ASCII receives a larger allowance.
+export function estimateTransferTokensByCounts(textLength: number, utf8Bytes: number, images = 0): number {
+  const nonAscii = Math.min(textLength, Math.ceil((utf8Bytes - textLength) / 2));
+  return Math.ceil((textLength - nonAscii) / 3.6 + nonAscii * 1.1) + images * 1024;
+}
+
 export function estimateTransferTokens(text: string, images = 0, utf8Bytes = Buffer.byteLength(text, "utf8")) {
-  const nonAscii = Math.min(text.length, Math.ceil((utf8Bytes - text.length) / 2));
-  return Math.ceil((text.length - nonAscii) / 3.6 + nonAscii * 1.1) + images * 1024;
+  return estimateTransferTokensByCounts(text.length, utf8Bytes, images);
 }

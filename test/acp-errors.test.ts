@@ -48,3 +48,15 @@ test("unknown failures are left untouched", () => {
   const original = new Error("something unusual");
   assert.equal(classifyAcpFailure(original), original);
 });
+
+test("network failures during oauth token refresh stay transport errors rather than auth", () => {
+  const eof = classify('token refresh failed due to network error: Post "https://oauth2.googleapis.com/token": EOF');
+  assert.equal(eof.code, "transport");
+  assert.match(eof.message, /HTTP_PROXY\/HTTPS_PROXY|network|connection/i);
+
+  const direct = classify('Failed to get OAuth token: failed to compute token: Post "https://oauth2.googleapis.com/token": EOF');
+  assert.equal(direct.code, "transport");
+
+  const revoked = classify('token refresh failed: invalid_grant');
+  assert.equal(revoked.code, "auth");
+});

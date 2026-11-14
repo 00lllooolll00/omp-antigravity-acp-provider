@@ -301,10 +301,6 @@ export class TranscriptRouting {
   forget(transcriptId: string, file?: string): string {
     const routingId = this.take(transcriptId, file);
     const route = this.byTranscript.get(transcriptId);
-    if (route?.owner) {
-      const current = this.currentSources.get(route.owner);
-      if (current?.transcriptId === transcriptId) this.currentSources.delete(route.owner);
-    }
     this.byTranscript.delete(transcriptId);
     const transcriptAttempt = this.pending.get(transcriptId);
     if (transcriptAttempt) this.removePending(transcriptAttempt);
@@ -312,6 +308,20 @@ export class TranscriptRouting {
     if (routingAttempt) this.removePending(routingAttempt);
     const replacement = this.replacementsById.get(routingId);
     if (replacement) this.retireReplacement(replacement);
+    if (route?.owner) {
+      const owner = route.owner;
+      const current = this.currentSources.get(owner);
+      if (current?.transcriptId === transcriptId) this.currentSources.delete(owner);
+      let stillReferenced = false;
+      for (const other of this.byTranscript.values()) {
+        if (other.owner === owner) { stillReferenced = true; break; }
+      }
+      if (!stillReferenced) {
+        this.invalidateOwnerSource(owner);
+        const ownedReplacement = this.replacements.get(owner);
+        if (ownedReplacement) this.retireReplacement(ownedReplacement);
+      }
+    }
     return routingId;
   }
 

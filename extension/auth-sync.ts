@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import fs from "node:fs";
@@ -81,6 +82,13 @@ export function antigravityAccountEmail(): string | undefined {
     return emailFromTokenJson(fs.readFileSync(path.join(resolveAntigravityAcpDirectory(), "acp_token.json"), "utf8"));
   } catch { /* no token file */ }
   return undefined;
+}
+
+export async function resolveAntigravityAccountEmail(): Promise<string | undefined> {
+  const fromFile = antigravityAccountEmail();
+  if (fromFile) return fromFile;
+  if ((await secretService.present()) !== true) return undefined;
+  return await secretService.accountEmail?.();
 }
 
 // Timing knobs for following OMP-side logouts; mutable so offline tests can
@@ -191,7 +199,9 @@ export async function removeOmpCredentialRecord(ctx: OmpCommandContext | undefin
     const credentials = ctx?.modelRegistry?.authStorage?.credentials;
     if (!credentials?.remove || !credentials.getOAuth) return "unavailable";
     if (!credentials.getOAuth("antigravity-acp")) return "absent";
-    await credentials.remove("antigravity-acp");
+    for (let attempt = 0; attempt < 16 && credentials.getOAuth("antigravity-acp"); attempt++) {
+      await credentials.remove("antigravity-acp");
+    }
     try { await ctx?.modelRegistry?.refreshProvider?.("antigravity-acp", "online"); } catch { /* advisory only */ }
     return "removed";
   } catch { return "unavailable"; }
@@ -206,13 +216,13 @@ export interface AuthCoordinatorDeps {
   pi: {
     on: (name: string, handler: (event: unknown, ctx: OmpCommandContext) => unknown) => void;
   };
+  stateDir?: string;
   connections: Set<TierConnection>;
   isPoolBusy: () => boolean;
   logoutAllRuntimes: () => Promise<void>;
   closeAllRuntimes: () => Promise<void>;
   onSyncProvider: () => void;
 }
-
 // OMP's oauth contract has no logout hook: /logout only removes the stored
 // marker credential. Watching the credential store's generation counter lets
 // this adapter finish the Antigravity-side logout when OMP reports removal.
@@ -226,8 +236,82 @@ export class OmpAuthCoordinator {
   apiKeyFallback = true;
   private followTimer: NodeJS.Timeout | undefined;
   private followRetry: NodeJS.Timeout | undefined;
+  private stopGenerationWatch: (() => void) | undefined;
+  private loginLockToken: string | undefined;
 
   constructor(private readonly deps: AuthCoordinatorDeps) {}
+
+  private get loginLockPath(): string | undefined {
+    return this.deps.stateDir ? path.join(this.deps.stateDir, "login-in-progress.json") : undefined;
+  }
+
+  private isProcessAlive(pid: number): boolean {
+    if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+    try { process.kill(pid, 0); return true; }
+    catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+  }
+
+  private readActiveLoginLock(): { pid: number; token: string; startedAt: number } | undefined {
+    const file = this.loginLockPath;
+    if (!file) return undefined;
+    try {
+      const raw = JSON.parse(fs.readFileSync(file, "utf8")) as { pid?: unknown; token?: unknown; startedAt?: unknown } | null;
+      if (typeof raw?.pid !== "number" || typeof raw?.token !== "string" || typeof raw?.startedAt !== "number") return undefined;
+      const age = Date.now() - raw.startedAt;
+      if (age > 10 * 60_000 || age < -60_000 || !this.isProcessAlive(raw.pid)) {
+        try { fs.rmSync(file, { force: true }); } catch {}
+        return undefined;
+      }
+      return { pid: raw.pid, token: raw.token, startedAt: raw.startedAt };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private isCrossProcessLoginActive(): boolean {
+    return this.readActiveLoginLock() !== undefined;
+  }
+
+  private acquireLoginLock(): void {
+    const file = this.loginLockPath;
+    if (!file) return;
+    const existing = this.readActiveLoginLock();
+    if (existing && existing.pid !== process.pid) {
+      throw new Error("Another OMP session is already signing in to Antigravity. Complete or cancel that login first.");
+    }
+    const token = randomUUID();
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, JSON.stringify({ pid: process.pid, token, startedAt: Date.now() }), { mode: 0o600 });
+    this.loginLockToken = token;
+  }
+
+  endFreshGoogleLogin(): void {
+    this.suppressFollow = false;
+    const file = this.loginLockPath;
+    const token = this.loginLockToken;
+    this.loginLockToken = undefined;
+    if (!file || !token) return;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { token?: unknown } | null;
+      if (parsed?.token === token) fs.rmSync(file, { force: true });
+    } catch { /* Already cleared or inaccessible. */ }
+  }
+
+  releaseContext(ctx?: OmpCommandContext): void {
+    if (!ctx || this.activeContext === ctx) this.activeContext = undefined;
+  }
+
+  dispose(): void {
+    clearTimeout(this.followTimer);
+    this.followTimer = undefined;
+    clearTimeout(this.followRetry);
+    this.followRetry = undefined;
+    this.activeContext = undefined;
+    this.stopGenerationWatch?.();
+    this.stopGenerationWatch = undefined;
+    this.watchingCredentials = false;
+    this.endFreshGoogleLogin();
+  }
 
   ompMarkerStored(ctx: OmpCommandContext | undefined): boolean | undefined {
     try {
@@ -272,7 +356,7 @@ export class OmpAuthCoordinator {
     this.followTimer = undefined;
     clearTimeout(this.followRetry);
     this.followRetry = undefined;
-    this.suppressFollow = false;
+    this.endFreshGoogleLogin();
     if (!this.apiKeyFallback) {
       this.apiKeyFallback = true;
       this.deps.onSyncProvider();
@@ -283,6 +367,7 @@ export class OmpAuthCoordinator {
     if (this.deps.isPoolBusy()) {
       throw new Error("Wait for active Antigravity requests to finish before logging in.");
     }
+    this.acquireLoginLock();
     // OMP removes the old marker while the browser sign-in is still running.
     // That generation change must not be mistaken for a user logout and close
     // the new ACP runtime before the login can finish.
@@ -291,17 +376,22 @@ export class OmpAuthCoordinator {
     this.followTimer = undefined;
     clearTimeout(this.followRetry);
     this.followRetry = undefined;
-    await this.deps.closeAllRuntimes();
-    // A different Google login must not restore the previous account's ACP
-    // mappings. OMP retains its transcript for a fresh backend reconstruction.
-    await this.deps.logoutAllRuntimes();
-    clearAntigravityCredentials();
-    // The old keychain/keyring entry must be gone before a new sign-in can
-    // start; an unconfirmed removal refuses the login instead of silently
-    // reusing it.
-    const removal = await this.removeStoredCredentialsDurably();
-    if (removal.keychainRemoved === false || removal.keyringRemoved === false) {
-      throw new Error("Unable to confirm removal of the Antigravity credential store entry");
+    try {
+      await this.deps.closeAllRuntimes();
+      // A different Google login must not restore the previous account's ACP
+      // mappings. OMP retains its transcript for a fresh backend reconstruction.
+      await this.deps.logoutAllRuntimes();
+      clearAntigravityCredentials();
+      // The old keychain/keyring entry must be gone before a new sign-in can
+      // start; an unconfirmed removal refuses the login instead of silently
+      // reusing it.
+      const removal = await this.removeStoredCredentialsDurably();
+      if (removal.keychainRemoved === false || removal.keyringRemoved === false) {
+        throw new Error("Unable to confirm removal of the Antigravity credential store entry");
+      }
+    } catch (error) {
+      this.endFreshGoogleLogin();
+      throw error;
     }
   }
 
@@ -309,6 +399,7 @@ export class OmpAuthCoordinator {
     if (this.deps.isPoolBusy()) {
       throw new Error("Wait for active Antigravity requests to finish before logging out.");
     }
+    this.endFreshGoogleLogin();
     clearTimeout(this.followTimer);
     this.followTimer = undefined;
     clearTimeout(this.followRetry);
@@ -338,6 +429,7 @@ export class OmpAuthCoordinator {
   }
 
   private async finishFollowedLogout(ctx: OmpCommandContext): Promise<void> {
+    if (this.isCrossProcessLoginActive()) return;
     const activeCtx = this.activeContext ?? ctx;
     if (this.deps.isPoolBusy()) {
       // Never interrupt an in-flight Antigravity request; retry once idle.
@@ -345,13 +437,14 @@ export class OmpAuthCoordinator {
       this.followRetry = setTimeout(() => {
         this.followRetry = undefined;
         const currentCtx = this.activeContext ?? activeCtx;
-        if (this.ompMarkerStored(currentCtx) === false) this.runFollowedLogout(currentCtx);
+        if (this.ompMarkerStored(currentCtx) === false && !this.isCrossProcessLoginActive()) this.runFollowedLogout(currentCtx);
       }, logoutFollow.retryMs);
       this.followRetry.unref?.();
       return;
     }
     await this.deps.logoutAllRuntimes();
     await this.deps.closeAllRuntimes();
+    if (this.isCrossProcessLoginActive()) return;
     // A quick re-login can restore the marker while the steps above await;
     // a restored or unknown marker keeps the new keychain/keyring entry
     // untouched.
@@ -392,7 +485,7 @@ export class OmpAuthCoordinator {
         this.suppressFollow = true;
       }
     });
-    credentials.onGeneration(() => {
+    this.stopGenerationWatch = credentials.onGeneration(() => {
       const activeCtx = this.activeContext ?? ctx;
       const current = this.ompMarkerStored(activeCtx);
       if (current === undefined) return;
@@ -412,7 +505,7 @@ export class OmpAuthCoordinator {
       this.followTimer = setTimeout(() => {
         this.followTimer = undefined;
         if (process.env.OMP_ACP_FOLLOW_LOGOUT === "0") return;
-        if (this.suppressFollow) {
+        if (this.suppressFollow || this.isCrossProcessLoginActive()) {
           this.suppressFollow = false;
           this.apiKeyFallback = true;
           this.deps.onSyncProvider();
@@ -427,7 +520,6 @@ export class OmpAuthCoordinator {
         }
         this.runFollowedLogout(currentCtx);
       }, logoutFollow.delayMs);
-      this.followTimer.unref?.();
     });
   }
 }

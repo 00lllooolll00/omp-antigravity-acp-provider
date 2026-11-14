@@ -27,13 +27,14 @@ interface MetricsTestHooks {
   historyRangeTextBytes(metrics: TestHistoryMetrics, start: number, end: number): number;
   assembleStep(instructions: TransferBlock | undefined, items: TestRecordItem[], tail: TransferBlock[]): TransferBlock[];
   takeTextChunk(text: string, maxBytes: number): string;
+  stepWireBytes(step: TransferBlock[]): number;
 }
 
 const metricHooks = (() => {
   const sourceFile = path.resolve("extension/context-transfer.ts");
   const compiled = buildSync({
     stdin: {
-      contents: fs.readFileSync(sourceFile, "utf8") + "\nexport { prepareHistoryMetrics, historyRangeTextBytes, assembleStep, historyRecordItems, takeTextChunk };",
+      contents: fs.readFileSync(sourceFile, "utf8") + "\nexport { prepareHistoryMetrics, historyRangeTextBytes, assembleStep, historyRecordItems, takeTextChunk, stepWireBytes };",
       resolveDir: path.dirname(sourceFile), sourcefile: sourceFile, loader: "ts",
     },
     bundle: true, write: false, outfile: path.join(path.dirname(sourceFile), "context-transfer-test.cjs"),
@@ -573,4 +574,21 @@ test("stableSystemInstructions ignores volatile reminders and tool lists but pre
   });
   assert.notEqual(policy, base);
   assert.match(policy, /NEW_SECURITY_POLICY/);
+});
+
+test("streaming stepWireBytes matches JSON.stringify UTF-8 bytes across escapes, surrogates and images", () => {
+  const tricky = 'ascii "quotes" \\slash\\ \b\f\n\r\t \u0000\u001f 中文𠮷 \ud83d lone-low:\udc00';
+  const step: TransferBlock[] = [
+    { type: "resource", resource: { uri: "urn:omp:antigravity-acp:history", mimeType: "text/plain", text: tricky.repeat(200) } },
+    { type: "text", text: tricky },
+    { type: "image", data: "BASE64_SHOULD_BE_MASKED".repeat(100), mimeType: "image/png" },
+  ];
+  const expected = Buffer.byteLength(JSON.stringify(step, function(this: unknown, _key, value: any) {
+    return this === step && value && typeof value === "object" && "type" in value && value.type === "image"
+      ? { ...value, data: "" }
+      : value;
+  }), "utf8");
+  assert.equal(metricHooks.stepWireBytes(step), expected);
+  const withToJson = [{ type: "text", text: "ok", extra: { toJSON: () => ({ a: 1 }) } } as unknown as TransferBlock];
+  assert.equal(metricHooks.stepWireBytes(withToJson), Buffer.byteLength(JSON.stringify(withToJson), "utf8"));
 });

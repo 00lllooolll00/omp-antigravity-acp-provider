@@ -1,6 +1,7 @@
 // Adapter-owned context transfer. The pinned upstream dependency stays intact.
 import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
-import { estimateTransferTokens, resolveContextOptions, type ContextOptions, type ResolvedContextOptions } from "./context-settings.ts";
+import { estimateTransferTokens, estimateTransferTokensByCounts, resolveContextOptions, type ContextOptions, type ResolvedContextOptions } from "./context-settings.ts";
+import { isSupportedSnapshot, valueMatches, valueSnapshot } from "./history-fingerprint.ts";
 import { TOOL_ROUTING } from "./tool-routing.ts";
 export interface TransferBlock {
   type: string;
@@ -123,7 +124,11 @@ function serializeRecord(record: unknown): string {
 }
 
 function makeHistoryText(recordJsons: string[]): string {
-  return recordJsons.length ? `${HISTORY_HEADER}[${recordJsons.join(",")}]${HISTORY_FOOTER}` : "";
+  if (!recordJsons.length) return "";
+  const parts: string[] = [HISTORY_HEADER, "[", recordJsons[0]!];
+  for (let i = 1; i < recordJsons.length; i++) parts.push(",", recordJsons[i]!);
+  parts.push("]", HISTORY_FOOTER);
+  return parts.join("");
 }
 
 function makeHistoryBlock(text: string): TransferBlock {
@@ -145,14 +150,167 @@ export function promptTextBytes(prompt: TransferBlock[]): number {
   return bytes;
 }
 
+const systemPromptCache = new WeakMap<object, { snapshot: unknown; prompt: string }>();
+
 export function currentSystemInstructions(context: TransferContext): string {
-  const prompt = getCurrentSystemPrompt(context.messages as never) || context.systemPrompt || "";
+  let systemCount = 0;
+  let soleSystem: object | undefined;
+  for (const message of context.messages) {
+    if (message.role === "system") {
+      systemCount++;
+      soleSystem = systemCount === 1 ? (message as object) : undefined;
+    }
+  }
+  let prompt: string;
+  if (systemCount === 0) {
+    prompt = context.systemPrompt || "";
+  } else if (systemCount === 1 && soleSystem) {
+    const cached = systemPromptCache.get(soleSystem);
+    if (cached && valueMatches(soleSystem, cached.snapshot)) {
+      prompt = cached.prompt;
+    } else {
+      prompt = getCurrentSystemPrompt(context.messages as never) || context.systemPrompt || "";
+      const snap = valueSnapshot(soleSystem);
+      if (isSupportedSnapshot(snap)) systemPromptCache.set(soleSystem, { snapshot: snap, prompt });
+    }
+  } else {
+    prompt = getCurrentSystemPrompt(context.messages as never) || context.systemPrompt || "";
+  }
   if (Buffer.byteLength(prompt, "utf8") > 134_217_728) throw new Error("OMP system instructions exceed the 128 MiB hard transfer ceiling; reduce them rather than truncating instructions");
   return prompt;
 }
 
 function safeJson(value: unknown): string {
   try { return JSON.stringify(value) ?? ""; } catch { return ""; }
+}
+
+function jsonStringCounts(value: string): { chars: number; bytes: number } {
+  let chars = 2;
+  let bytes = 2;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code < 0x80) {
+      if (code === 0x22 || code === 0x5c || code === 0x08 || code === 0x0c || code === 0x0a || code === 0x0d || code === 0x09) {
+        chars += 2;
+        bytes += 2;
+      } else if (code < 0x20) {
+        chars += 6;
+        bytes += 6;
+      } else {
+        chars += 1;
+        bytes += 1;
+      }
+    } else if (code < 0x800) {
+      chars += 1;
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      const next = index + 1 < value.length ? value.charCodeAt(index + 1) : 0;
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        chars += 2;
+        bytes += 4;
+        index++;
+      } else {
+        chars += 6;
+        bytes += 6;
+      }
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      chars += 6;
+      bytes += 6;
+    } else {
+      chars += 1;
+      bytes += 3;
+    }
+  }
+  return { chars, bytes };
+}
+
+function jsonValueCounts(
+  value: unknown,
+  depth = 0,
+  seen = new Set<object>(),
+  maskStepImages = false,
+): { chars: number; bytes: number } | undefined {
+  if (value === null) return { chars: 4, bytes: 4 };
+  const type = typeof value;
+  if (type === "boolean") return value ? { chars: 4, bytes: 4 } : { chars: 5, bytes: 5 };
+  if (type === "number") {
+    const s = Number.isFinite(value as number) ? String(value) : "null";
+    return { chars: s.length, bytes: s.length };
+  }
+  if (type === "string") return jsonStringCounts(value as string);
+  if (type !== "object") return undefined;
+  const obj = value as object;
+  if (depth > 24 || seen.has(obj)) return undefined;
+  const isArray = Array.isArray(obj);
+  const proto = Object.getPrototypeOf(obj);
+  if (isArray ? proto !== Array.prototype : proto !== Object.prototype && proto !== null) return undefined;
+  if ("toJSON" in obj && typeof (obj as { toJSON?: unknown }).toJSON === "function") return undefined;
+  seen.add(obj);
+  try {
+    if (isArray) {
+      const arr = obj as unknown[];
+      if (arr.length === 0) return { chars: 2, bytes: 2 };
+      let chars = 2;
+      let bytes = 2;
+      for (let i = 0; i < arr.length; i++) {
+        if (i > 0) { chars += 1; bytes += 1; }
+        let item = arr[i];
+        if (maskStepImages && item && typeof item === "object" && "type" in item && (item as { type?: unknown }).type === "image") {
+          item = { ...(item as Record<string, unknown>), data: "" };
+        }
+        if (item === undefined || typeof item === "function" || typeof item === "symbol") {
+          chars += 4;
+          bytes += 4;
+        } else {
+          const sub = jsonValueCounts(item, depth + 1, seen, false);
+          if (!sub) return undefined;
+          chars += sub.chars;
+          bytes += sub.bytes;
+        }
+      }
+      return { chars, bytes };
+    }
+    const keys = Object.keys(obj);
+    if (keys.length === 0) return { chars: 2, bytes: 2 };
+    let chars = 2;
+    let bytes = 2;
+    let emitted = false;
+    for (let i = 0; i < keys.length; i++) {
+      const key = keys[i]!;
+      const desc = Object.getOwnPropertyDescriptor(obj, key);
+      if (!desc || !("value" in desc)) return undefined;
+      const prop = desc.value;
+      if (prop === undefined || typeof prop === "function" || typeof prop === "symbol") continue;
+      const sub = jsonValueCounts(prop, depth + 1, seen, false);
+      if (!sub) return undefined;
+      if (emitted) { chars += 1; bytes += 1; }
+      const keyCounts = jsonStringCounts(key);
+      chars += keyCounts.chars + 1 + sub.chars;
+      bytes += keyCounts.bytes + 1 + sub.bytes;
+      emitted = true;
+    }
+    return { chars, bytes };
+  } finally {
+    seen.delete(obj);
+  }
+}
+
+function safeJsonCounts(value: unknown): { chars: number; bytes: number } {
+  const measured = jsonValueCounts(value);
+  if (measured) return measured;
+  const raw = safeJson(value);
+  return { chars: raw.length, bytes: Buffer.byteLength(raw, "utf8") };
+}
+
+function stepWireBytes(step: TransferBlock[]): number {
+  const measured = jsonValueCounts(step, 0, new Set(), true);
+  if (measured) return measured.bytes;
+  const wireText = JSON.stringify(step, function(this: unknown, _key, value: unknown) {
+    return this === step && value && typeof value === "object" && "type" in value && value.type === "image"
+      ? { ...value, data: "" }
+      : value;
+  });
+  return Buffer.byteLength(wireText, "utf8");
 }
 
 function estimateMessageTokens(content: string | TransferBlock[]): number {
@@ -162,10 +320,26 @@ function estimateMessageTokens(content: string | TransferBlock[]): number {
     if (!block || typeof block !== "object") continue;
     if (block.type === "text") tokens += estimateTransferTokens(block.text ?? "");
     else if (block.type === "thinking") tokens += estimateTransferTokens((block as { thinking?: string }).thinking ?? "");
-    else if (block.type === "toolCall") tokens += estimateTransferTokens(`${block.name ?? ""}\n${safeJson(block.arguments)}`);
-    else if (block.type === "image") tokens += 1024;
+    else if (block.type === "toolCall") {
+      const name = block.name ?? "";
+      const args = safeJsonCounts(block.arguments);
+      tokens += estimateTransferTokensByCounts(name.length + 1 + args.chars, Buffer.byteLength(name, "utf8") + 1 + args.bytes);
+    } else if (block.type === "image") tokens += 1024;
   }
   return tokens;
+}
+
+const messageTokenCache = new WeakMap<object, { snapshot: unknown; tokens: number }>();
+
+function worthCachingMessageTokens(content: TransferBlock[]): boolean {
+  let chars = 0;
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type === "toolCall") return true;
+    if (typeof block.text === "string" && (chars += block.text.length) >= 1024) return true;
+    if (typeof (block as { thinking?: unknown }).thinking === "string" && (chars += (block as { thinking: string }).thinking.length) >= 1024) return true;
+  }
+  return false;
 }
 
 // OMP needs an occupancy signal even when the ACP runtime only reports
@@ -177,14 +351,31 @@ export function estimateContextTokens(context: TransferContext): number {
   for (const message of context.messages) {
     // currentSystemInstructions already counts the collapsed system message.
     if (message.role === "system") continue;
-    tokens += estimateMessageTokens(message.content) + 4;
+    if (typeof message.content === "string" || !worthCachingMessageTokens(message.content)) {
+      tokens += estimateMessageTokens(message.content) + 4;
+      continue;
+    }
+    const msgObj = message as object;
+    const cached = messageTokenCache.get(msgObj);
+    if (cached && valueMatches(message.content, cached.snapshot)) {
+      tokens += cached.tokens;
+      continue;
+    }
+    const computed = estimateMessageTokens(message.content) + 4;
+    const snap = valueSnapshot(message.content);
+    if (isSupportedSnapshot(snap)) messageTokenCache.set(msgObj, { snapshot: snap, tokens: computed });
+    tokens += computed;
   }
   if (context.tools?.length) {
-    let schemas = "";
+    let schemaChars = 0;
+    let schemaBytes = 0;
     for (const tool of context.tools) {
-      schemas += `${tool.name}\n${tool.description ?? ""}\n${safeJson(tool.parameters)}\n`;
+      const desc = tool.description ?? "";
+      const params = safeJsonCounts(tool.parameters);
+      schemaChars += tool.name.length + 1 + desc.length + 1 + params.chars + 1;
+      schemaBytes += Buffer.byteLength(tool.name, "utf8") + 1 + Buffer.byteLength(desc, "utf8") + 1 + params.bytes + 1;
     }
-    tokens += estimateTransferTokens(schemas);
+    tokens += estimateTransferTokensByCounts(schemaChars, schemaBytes);
   }
   return Math.max(1, Math.ceil(tokens));
 }
@@ -199,13 +390,22 @@ function isVolatileReminder(body: string): boolean {
     /^Today: .*$/u.test(line) || /^OMP tool names: .*$/u.test(line));
 }
 
+let lastStableRaw: string | undefined;
+let lastStableNormalized: string | undefined;
+
 export function stableSystemContent(text: string): string {
-  return text
-    .replace(DATE_CWD_REMINDER, "")
-    .replace(SYSTEM_REMINDER_TAG, (match, body: string) => isVolatileReminder(body) ? "" : match)
-    .replace(OMP_TOOL_NAMES_LINE, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  if (text === lastStableRaw && lastStableNormalized !== undefined) return lastStableNormalized;
+  const normalized = !text.includes("Today:") && !text.includes("<system-reminder>") && !text.includes("OMP tool names:") && !text.includes("\n\n\n")
+    ? text.trim()
+    : text
+      .replace(DATE_CWD_REMINDER, "")
+      .replace(SYSTEM_REMINDER_TAG, (match, body: string) => isVolatileReminder(body) ? "" : match)
+      .replace(OMP_TOOL_NAMES_LINE, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  lastStableRaw = text;
+  lastStableNormalized = normalized;
+  return normalized;
 }
 
 // OMP injects a date/cwd reminder and dynamic tool lists around turns. Their
@@ -342,10 +542,12 @@ function planHistorySteps(
         cursor++;
         continue;
       }
-      const rejected = assembleStep(chunkInstructions, items.slice(start, cursor + 1), seedTail);
-      const actual = promptTextBytes(rejected);
-      if (actual !== predicted || actual <= ACP_STEP_TEXT_BYTES) {
-        throw new Error(`History chunk planner predicted ${predicted} bytes for a rejected candidate but rendered ${actual}`);
+      if (process.env.OMP_ACP_PLAN_VERIFY === "1") {
+        const rejected = assembleStep(chunkInstructions, items.slice(start, cursor + 1), seedTail);
+        const actual = promptTextBytes(rejected);
+        if (actual !== predicted || actual <= ACP_STEP_TEXT_BYTES) {
+          throw new Error(`History chunk planner predicted ${predicted} bytes for a rejected candidate but rendered ${actual}`);
+        }
       }
       break;
     }
@@ -361,20 +563,30 @@ function planHistorySteps(
     const predicted = (stepInstructions ? instructionBytes : 0)
       + historyRangeTextBytes(metrics, span.start, span.end) + seedTailBytes;
     const step = assembleStep(stepInstructions, items.slice(span.start, span.end), seedTail);
-    const actual = promptTextBytes(step);
-    if (actual !== predicted) throw new Error(`History chunk planner predicted ${predicted} bytes but rendered ${actual}`);
-    checkStepTextBytes(actual);
+    if (process.env.OMP_ACP_PLAN_VERIFY === "1") {
+      const actual = promptTextBytes(step);
+      if (actual !== predicted) throw new Error(`History chunk planner predicted ${predicted} bytes but rendered ${actual}`);
+      checkStepTextBytes(actual);
+    } else {
+      checkStepTextBytes(predicted);
+    }
     return step;
   });
   const effectiveFinalInstructions = finalInstructions ?? pendingInstructions;
   const prompt = assembleStep(effectiveFinalInstructions, items.slice(cursor), tailBlocks);
-  const actualPromptBytes = promptTextBytes(prompt);
-  const predictedPromptBytes = (effectiveFinalInstructions ? instructionBytes : 0)
-    + historyRangeTextBytes(metrics, cursor, items.length) + tailBytes;
-  if (actualPromptBytes !== predictedPromptBytes) {
-    throw new Error(`History chunk planner predicted ${predictedPromptBytes} bytes for the final prompt but rendered ${actualPromptBytes}`);
+  if (process.env.OMP_ACP_PLAN_VERIFY === "1") {
+    const actualPromptBytes = promptTextBytes(prompt);
+    const predictedPromptBytes = (effectiveFinalInstructions ? instructionBytes : 0)
+      + historyRangeTextBytes(metrics, cursor, items.length) + tailBytes;
+    if (actualPromptBytes !== predictedPromptBytes) {
+      throw new Error(`History chunk planner predicted ${predictedPromptBytes} bytes for the final prompt but rendered ${actualPromptBytes}`);
+    }
+    checkStepTextBytes(actualPromptBytes);
+  } else {
+    const predictedPromptBytes = (effectiveFinalInstructions ? instructionBytes : 0)
+      + historyRangeTextBytes(metrics, cursor, items.length) + tailBytes;
+    checkStepTextBytes(predictedPromptBytes);
   }
-  checkStepTextBytes(actualPromptBytes);
   return { prompt, seedSteps };
 }
 
@@ -390,12 +602,18 @@ function requestFinalHeader(inProgress: boolean): string {
     : "");
 }
 
-function takeTextChunk(text: string, maxBytes: number): string {
-  if (maxBytes <= 0) return "";
-  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+function takeTextChunkSpan(text: string, maxBytes: number, startOffset = 0): { end: number; bytes: number } {
+  if (maxBytes <= 0 || startOffset >= text.length) return { end: startOffset, bytes: 0 };
+  const remainingChars = text.length - startOffset;
+  if (remainingChars * 3 <= maxBytes) {
+    const tail = startOffset === 0 ? text : text.slice(startOffset);
+    return { end: text.length, bytes: Buffer.byteLength(tail, "utf8") };
+  }
   let bytes = 0;
-  let end = 0;
-  for (let index = 0; index < text.length;) {
+  let end = startOffset;
+  let lastNewlineEnd = -1;
+  let lastNewlineBytes = 0;
+  for (let index = startOffset; index < text.length;) {
     const codePoint = text.codePointAt(index)!;
     const units = codePoint > 0xffff ? 2 : 1;
     const size = codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
@@ -403,16 +621,26 @@ function takeTextChunk(text: string, maxBytes: number): string {
     bytes += size;
     end += units;
     index += units;
+    if (codePoint === 0x0a) {
+      lastNewlineEnd = end;
+      lastNewlineBytes = bytes;
+    }
   }
-  if (end === 0) return [...text][0] ?? "";
-  const chunk = text.slice(0, end);
-  // Prefer a line boundary when it keeps most of the available budget. This
-  // preserves readable code/diff chunks without ever changing their bytes.
-  const newline = chunk.lastIndexOf("\n");
-  if (newline > 0 && Buffer.byteLength(chunk.slice(0, newline + 1), "utf8") >= maxBytes * 0.5) {
-    return chunk.slice(0, newline + 1);
+  if (end === startOffset) {
+    const codePoint = text.codePointAt(startOffset)!;
+    const units = codePoint > 0xffff ? 2 : 1;
+    const size = codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+    return { end: startOffset + units, bytes: size };
   }
-  return chunk;
+  if (end < text.length && lastNewlineEnd > startOffset + 1 && lastNewlineBytes >= maxBytes * 0.5) {
+    return { end: lastNewlineEnd, bytes: lastNewlineBytes };
+  }
+  return { end, bytes };
+}
+
+function takeTextChunk(text: string, maxBytes: number): string {
+  const span = takeTextChunkSpan(text, maxBytes, 0);
+  return span.end === text.length ? text : text.slice(0, span.end);
 }
 
 function splitOversizedRequest(blocks: TransferBlock[], inProgress: boolean): RequestSplit {
@@ -439,28 +667,29 @@ function splitOversizedRequest(blocks: TransferBlock[], inProgress: boolean): Re
     currentBytes = 0;
   };
   const appendText = (source: TransferBlock, text: string) => {
-    let rest = text;
+    let offset = 0;
     const resource = source.type === "resource" && source.resource ? source.resource : undefined;
     const overhead = resource
       ? Buffer.byteLength(`Embedded resource (${resource.uri}):\n`, "utf8") + 2
       : 2;
-    while (rest) {
+    while (offset < text.length) {
       const capacity = maxSeedContent - currentBytes - overhead;
       if (capacity <= 0) {
         flush();
         continue;
       }
-      const chunk = takeTextChunk(rest, capacity);
-      if (!chunk) {
+      const span = takeTextChunkSpan(text, capacity, offset);
+      if (span.end <= offset) {
         flush();
         continue;
       }
+      const chunk = offset === 0 && span.end === text.length ? text : text.slice(offset, span.end);
       current.push(resource
         ? { ...source, resource: { ...resource, text: chunk } }
         : { ...source, text: chunk });
-      currentBytes += Buffer.byteLength(chunk, "utf8") + overhead;
-      rest = rest.slice(chunk.length);
-      if (rest) flush();
+      currentBytes += span.bytes + overhead;
+      offset = span.end;
+      if (offset < text.length) flush();
     }
   };
   for (const block of blocks) {
@@ -520,10 +749,11 @@ function historyRecordItems(
       // future cold replay fail. Split its text into bounded records; the
       // history envelope still marks every part as reference data.
       const chunks: RecordItem[] = [];
-      let rest = record.content;
-      while (rest) {
-        let limit = Math.min(Buffer.byteLength(rest, "utf8"), HISTORY_RECORD_CHUNK_BYTES);
-        let chunk = takeTextChunk(rest, limit);
+      const fullText = record.content;
+      let offset = 0;
+      while (offset < fullText.length) {
+        let span = takeTextChunkSpan(fullText, HISTORY_RECORD_CHUNK_BYTES, offset);
+        let chunk = offset === 0 && span.end === fullText.length ? fullText : fullText.slice(offset, span.end);
         let candidate: HistoryRecord;
         let json: string;
         for (;;) {
@@ -533,14 +763,14 @@ function historyRecordItems(
             break;
           } catch (splitError) {
             const splitMessage = splitError instanceof Error ? splitError.message : "";
-            const size = Buffer.byteLength(chunk, "utf8");
-            if (!splitMessage.includes("Maximum context length exceeded") || size <= 1) throw splitError;
-            limit = Math.max(1, Math.floor(size * 0.8));
-            chunk = takeTextChunk(rest, limit);
+            if (!splitMessage.includes("Maximum context length exceeded") || span.bytes <= 1) throw splitError;
+            const limit = Math.max(1, Math.floor(span.bytes * 0.8));
+            span = takeTextChunkSpan(fullText, limit, offset);
+            chunk = fullText.slice(offset, span.end);
           }
         }
         chunks.push(make(candidate, [], [], json));
-        rest = rest.slice(chunk.length);
+        offset = span.end;
       }
       return chunks;
     }
@@ -563,26 +793,28 @@ function historyRecordItems(
       };
       for (const block of record.content) {
         if (block.type === "text") {
-          let rest = block.text ?? "";
-          if (!rest) {
+          const text = block.text ?? "";
+          if (!text) {
             current.push(block);
             continue;
           }
-          while (rest) {
+          let offset = 0;
+          while (offset < text.length) {
             const capacity = HISTORY_RECORD_CHUNK_BYTES - currentBytes;
             if (capacity <= 0) {
               flush();
               continue;
             }
-            const chunk = takeTextChunk(rest, capacity);
-            if (!chunk) {
+            const span = takeTextChunkSpan(text, capacity, offset);
+            if (span.end <= offset) {
               flush();
               continue;
             }
+            const chunk = offset === 0 && span.end === text.length ? text : text.slice(offset, span.end);
             current.push({ ...block, text: chunk });
-            currentBytes += Buffer.byteLength(chunk, "utf8");
-            rest = rest.slice(chunk.length);
-            if (rest) flush();
+            currentBytes += span.bytes;
+            offset = span.end;
+            if (offset < text.length) flush();
           }
         } else {
           current.push(block);
@@ -698,8 +930,25 @@ export function buildPromptParts(context: TransferContext, fresh: boolean, unsee
     const content = messages[latest]!.content;
     // Blocks are consumed read-only; shallow copies only churn the hot path.
     const latestBlocks: TransferBlock[] = typeof content === "string" ? [{ type: "text", text: content }] : content;
+    const budget = historyBudget(undefined, process.env, options.maxTransferBytes);
     const normalTail: TransferBlock[] = [boundary, ...latestBlocks];
     if (promptTextBytes(normalTail) > ACP_STEP_TEXT_BYTES) {
+      let rawTextBytes = 0;
+      let earlyImageBytes = 0;
+      for (const block of images) {
+        if (block.type === "image") earlyImageBytes += Math.ceil((block.data?.length ?? 0) * 3 / 4);
+      }
+      for (const block of latestBlocks) {
+        if (block.type === "text" && block.text) rawTextBytes += Buffer.byteLength(block.text, "utf8");
+        else if (block.type === "resource" && block.resource?.text) rawTextBytes += Buffer.byteLength(block.resource.text, "utf8");
+        else if (block.type === "image") earlyImageBytes += Math.ceil((block.data?.length ?? 0) * 3 / 4);
+      }
+      if (earlyImageBytes > options.maxImageBytes) {
+        throw new Error(`Request payload too large (413): local ACP image budget is ${options.maxImageBytes} bytes; reduce attachments. No images were silently omitted.`);
+      }
+      if (rawTextBytes > budget) {
+        throw new Error(`Request payload too large (413): local ACP transfer needs at least ${rawTextBytes} bytes; budget is ${budget}. Use OMP /compact or raise maxTransferBytes. No history was silently truncated.`);
+      }
       const split = splitOversizedRequest(latestBlocks, inProgress);
       requestSeedSteps = split.seedSteps;
       tailBlocks = split.tailBlocks;
@@ -739,20 +988,30 @@ export function buildPromptParts(context: TransferContext, fresh: boolean, unsee
   let bytes = imageWireChars;
   let estimatedTokens = 0;
   for (const step of allSteps) {
-    const wireText = JSON.stringify(step, function(this: unknown, _key, value: unknown) {
-      return this === step && value && typeof value === "object" && "type" in value && value.type === "image"
-        ? { ...value, data: "" }
-        : value;
-    });
-    bytes += Buffer.byteLength(wireText, "utf8");
-    let text = "";
+    let textChars = 0;
+    let textBytes = 0;
     let stepImages = 0;
     for (const block of step) {
-      if (block.type === "text") text += block.text ?? "";
-      else if (block.type === "resource" && block.resource) text += block.resource.text;
-      else if (block.type === "image") stepImages++;
+      if (block.type === "text") {
+        const text = block.text ?? "";
+        textChars += text.length;
+        textBytes += Buffer.byteLength(text, "utf8");
+      } else if (block.type === "resource" && block.resource) {
+        textChars += block.resource.text.length;
+        textBytes += Buffer.byteLength(block.resource.text, "utf8");
+      } else if (block.type === "image") stepImages++;
     }
-    estimatedTokens += estimateTransferTokens(text, stepImages, Buffer.byteLength(text, "utf8"));
+    if (textBytes > 32_768) {
+      bytes += stepWireBytes(step);
+    } else {
+      const wireText = JSON.stringify(step, function(this: unknown, _key, value: unknown) {
+        return this === step && value && typeof value === "object" && "type" in value && value.type === "image"
+          ? { ...value, data: "" }
+          : value;
+      });
+      bytes += Buffer.byteLength(wireText, "utf8");
+    }
+    estimatedTokens += estimateTransferTokensByCounts(textChars, textBytes, stepImages);
   }
   const budget = historyBudget(undefined, process.env, options.maxTransferBytes);
   if (bytes > budget) throw new Error(`Request payload too large (413): local ACP transfer needs ${bytes} bytes; budget is ${budget}. Use OMP /compact or raise maxTransferBytes. No history was silently truncated.`);

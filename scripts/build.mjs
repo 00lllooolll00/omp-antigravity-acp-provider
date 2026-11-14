@@ -935,6 +935,129 @@ const result = await build({
           "\t\t\t\tclientCapabilities: {\n\t\t\t\t\tfs: { readTextFile: false, writeTextFile: false },\n\t\t\t\t\tterminal: false,\n\t\t\t\t\tsession: { compaction: {} },\n\t\t\t\t},");
         return { contents, loader: "ts" };
       });
+      builder.onResolve({ filter: /^\.\/assets\/zip-archive\.mjs$/ }, () => ({
+        path: "./assets/zip-archive.mjs",
+        external: true,
+      }));
+      builder.onLoad({ filter: /[\\/]node_modules[\\/]zod[\\/]v4[\\/]locales[\\/]index\.js$/ }, () => ({
+        contents: 'export { default as en } from "./en.js";\n',
+        loader: "js",
+      }));
+      builder.onLoad({ filter: /[\\/]src[\\/]acp[\\/]setup\.ts$/ }, async ({ path: file }) => {
+        if (file !== path.join(upstream, "src/acp/setup.ts")) return;
+        let contents = await fs.readFile(file, "utf8");
+        const importAnchor = 'import { Open, type File as ZipFile } from "unzipper";';
+        const callAnchor = "\tconst archive = await Open.file(archivePath);";
+        if (contents.split(importAnchor).length !== 2 || contents.split(callAnchor).length !== 2) {
+          throw new Error("Pinned upstream unzipper setup seam changed; review compatibility");
+        }
+        contents = contents
+          .replace(importAnchor, 'import type { File as ZipFile } from "unzipper";')
+          .replace(callAnchor, '\tconst { Open } = await import("./assets/zip-archive.mjs");\n\tconst archive = await Open.file(archivePath);');
+        return { contents, loader: "ts" };
+      });
+      builder.onLoad({ filter: /[\\/]src[\\/]acp[\\/]bounded-stream\.ts$/ }, async ({ path: file }) => {
+        if (file !== path.join(upstream, "src/acp/bounded-stream.ts")) return;
+        let contents = await fs.readFile(file, "utf8");
+        const loopAnchor = [
+          "\t\t\tlet pending: Uint8Array<ArrayBufferLike> = new Uint8Array(0);",
+          "\t\t\ttry {",
+          "\t\t\t\tfor (;;) {",
+          "\t\t\t\t\tconst { value, done } = await reader.read();",
+          "\t\t\t\t\tif (done) break;",
+          "\t\t\t\t\tif (!value || value.byteLength === 0) continue;",
+          "\t\t\t\t\tpending = appendBytes(pending, value);",
+          "\t\t\t\t\tif (pending.byteLength > maxFrameBytes && pending.indexOf(0x0a) < 0) {",
+          "\t\t\t\t\t\tthrow new Error(`ACP frame exceeds ${maxFrameBytes} bytes`);",
+          "\t\t\t\t\t}",
+          "",
+          "\t\t\t\t\tlet newline: number;",
+          "\t\t\t\t\twhile ((newline = pending.indexOf(0x0a)) >= 0) {",
+          "\t\t\t\t\t\tconst frame = pending.subarray(0, newline);",
+          "\t\t\t\t\t\tpending = pending.slice(newline + 1);",
+          "\t\t\t\t\t\tif (frame.byteLength > maxFrameBytes) {",
+          "\t\t\t\t\t\t\tthrow new Error(`ACP frame exceeds ${maxFrameBytes} bytes`);",
+          "\t\t\t\t\t\t}",
+          "\t\t\t\t\t\tenqueueFrame(frame, decoder, controller, options.onCompatibilityNoise);",
+          "\t\t\t\t\t}",
+          "\t\t\t\t}",
+          "",
+          "\t\t\t\tif (pending.byteLength > 0) {",
+          "\t\t\t\t\tif (pending.byteLength > maxFrameBytes) {",
+          "\t\t\t\t\t\tthrow new Error(`ACP frame exceeds ${maxFrameBytes} bytes`);",
+          "\t\t\t\t\t}",
+          "\t\t\t\t\tenqueueFrame(pending, decoder, controller, options.onCompatibilityNoise);",
+          "\t\t\t\t}",
+        ].join("\n");
+        if (contents.split(loopAnchor).length !== 2) {
+          throw new Error("Pinned upstream bounded-stream seam changed; review compatibility");
+        }
+        const replacement = [
+          "\t\t\tconst chunks: Uint8Array<ArrayBufferLike>[] = [];",
+          "\t\t\tlet chunkBytes = 0;",
+          "\t\t\ttry {",
+          "\t\t\t\tfor (;;) {",
+          "\t\t\t\t\tconst { value, done } = await reader.read();",
+          "\t\t\t\t\tif (done) break;",
+          "\t\t\t\t\tif (!value || value.byteLength === 0) continue;",
+          "\t\t\t\t\tlet offset = 0;",
+          "\t\t\t\t\tlet newline = value.indexOf(0x0a, offset);",
+          "\t\t\t\t\tif (newline < 0) {",
+          "\t\t\t\t\t\tif (chunkBytes + value.byteLength > maxFrameBytes) {",
+          "\t\t\t\t\t\t\tthrow new Error(`ACP frame exceeds ${maxFrameBytes} bytes`);",
+          "\t\t\t\t\t\t}",
+          "\t\t\t\t\t\tchunks.push(value.slice());",
+          "\t\t\t\t\t\tchunkBytes += value.byteLength;",
+          "\t\t\t\t\t\tcontinue;",
+          "\t\t\t\t\t}",
+          "\t\t\t\t\twhile (newline >= 0) {",
+          "\t\t\t\t\t\tconst tail = value.subarray(offset, newline);",
+          "\t\t\t\t\t\tconst frameLength = chunkBytes + tail.byteLength;",
+          "\t\t\t\t\t\tif (frameLength > maxFrameBytes) {",
+          "\t\t\t\t\t\t\tthrow new Error(`ACP frame exceeds ${maxFrameBytes} bytes`);",
+          "\t\t\t\t\t\t}",
+          "\t\t\t\t\t\tlet frame: Uint8Array<ArrayBufferLike>;",
+          "\t\t\t\t\t\tif (chunks.length === 0) {",
+          "\t\t\t\t\t\t\tframe = tail;",
+          "\t\t\t\t\t\t} else {",
+          "\t\t\t\t\t\t\tframe = new Uint8Array(frameLength);",
+          "\t\t\t\t\t\t\tlet cursor = 0;",
+          "\t\t\t\t\t\t\tfor (const part of chunks) { frame.set(part, cursor); cursor += part.byteLength; }",
+          "\t\t\t\t\t\t\tif (tail.byteLength > 0) frame.set(tail, cursor);",
+          "\t\t\t\t\t\t\tchunks.length = 0;",
+          "\t\t\t\t\t\t\tchunkBytes = 0;",
+          "\t\t\t\t\t\t}",
+          "\t\t\t\t\t\tenqueueFrame(frame, decoder, controller, options.onCompatibilityNoise);",
+          "\t\t\t\t\t\toffset = newline + 1;",
+          "\t\t\t\t\t\tnewline = offset < value.byteLength ? value.indexOf(0x0a, offset) : -1;",
+          "\t\t\t\t\t}",
+          "\t\t\t\t\tif (offset < value.byteLength) {",
+          "\t\t\t\t\t\tconst rest = value.subarray(offset);",
+          "\t\t\t\t\t\tif (rest.byteLength > maxFrameBytes) {",
+          "\t\t\t\t\t\t\tthrow new Error(`ACP frame exceeds ${maxFrameBytes} bytes`);",
+          "\t\t\t\t\t\t}",
+          "\t\t\t\t\t\tchunks.push(rest.slice());",
+          "\t\t\t\t\t\tchunkBytes = rest.byteLength;",
+          "\t\t\t\t\t}",
+          "\t\t\t\t}",
+          "",
+          "\t\t\t\tif (chunkBytes > 0) {",
+          "\t\t\t\t\tif (chunkBytes > maxFrameBytes) {",
+          "\t\t\t\t\t\tthrow new Error(`ACP frame exceeds ${maxFrameBytes} bytes`);",
+          "\t\t\t\t\t}",
+          "\t\t\t\t\tconst frame = chunks.length === 1 ? chunks[0]! : (() => {",
+          "\t\t\t\t\t\tconst joined = new Uint8Array(chunkBytes);",
+          "\t\t\t\t\t\tlet cursor = 0;",
+          "\t\t\t\t\t\tfor (const part of chunks) { joined.set(part, cursor); cursor += part.byteLength; }",
+          "\t\t\t\t\t\treturn joined;",
+          "\t\t\t\t\t})();",
+          "\t\t\t\t\tchunks.length = 0;",
+          "\t\t\t\t\tenqueueFrame(frame, decoder, controller, options.onCompatibilityNoise);",
+          "\t\t\t\t}",
+        ].join("\n");
+        contents = contents.replace(loopAnchor, replacement);
+        return { contents, loader: "ts" };
+      });
       builder.onLoad({ filter: /\/(?:process|runtime-manifest)\.ts$/ }, async ({ path: file }) => {
         const relative = path.relative(upstream, file).split(path.sep).join("/");
         return {
@@ -951,10 +1074,30 @@ const result = await build({
   logLevel: "info",
 });
 
+const zipResult = await build({
+  stdin: {
+    contents: 'export { Open } from "unzipper";',
+    resolveDir: root,
+    sourcefile: "omp-zip-entry.ts",
+    loader: "ts",
+  },
+  bundle: true,
+  metafile: true,
+  minify: true,
+  legalComments: "none",
+  platform: "node",
+  format: "esm",
+  target: "node22",
+  banner: { js: 'import { createRequire as __ompCreateRequire } from "node:module"; const require = __ompCreateRequire(import.meta.url);' },
+  external: ["@aws-sdk/client-s3"],
+  outfile: path.join(assets, "zip-archive.mjs"),
+  logLevel: "info",
+});
+
 // The npm tarball ships a bundle. Include the full notices of packages whose
 // code is bundled, in addition to their individually installed npm licenses.
 const packages = new Map();
-for (const input of Object.keys(result.metafile.inputs)) {
+for (const input of [...Object.keys(result.metafile.inputs), ...Object.keys(zipResult.metafile.inputs)]) {
   if (!input.includes("node_modules")) continue;
   let directory = path.dirname(path.resolve(root, input));
   while (directory !== path.dirname(directory)) {

@@ -415,3 +415,53 @@ test("OMP_ACP_WARMUP=off disables warmup and permissions change closes published
     await fixture.restore();
   }
 });
+
+test("switching away from antigravity-acp closes standby and active connections skip redundant warmup", async () => {
+  const fixture = await createIsolatedFixture();
+  try {
+    const hooks = new Map<string, Hook>();
+    let provider: Provider | undefined;
+    const { createConnection, records } = makeFakeConnectionFactory();
+    await registerOmpAdapter(
+      {
+        on(name, fn) { hooks.set(name, fn); },
+        registerTool() {},
+        registerProvider(_name, value) { provider = value as Provider; },
+        registerCommand() {},
+      },
+      fixture.state,
+      createConnection,
+      {
+        standbyWarmup: true,
+        prepareRuntime: async () => {},
+        authReady: async () => true,
+      },
+    );
+    assert.ok(provider);
+    const ctx: OmpCommandContext = { ui: { notify() {} } };
+    await hooks.get("session_start")!({ model: { provider: "antigravity-acp" } }, ctx);
+    await waitFor(() => records.length === 1 && records[0]!.initializeCalls === 1, "initial warmup");
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    // Selecting a different provider releases the idle standby process.
+    hooks.get("model_select")!({ model: { provider: "openai" } }, ctx);
+    await waitFor(() => records[0]!.closeCalls === 1, "model_select away closes standby");
+
+    // Warm up again, consume via prompt, then verify model_select on an active session does not spawn an extra standby.
+    await hooks.get("session_start")!({ model: { provider: "antigravity-acp" } }, ctx);
+    await waitFor(() => records.length === 2 && records[1]!.initializeCalls === 1, "second warmup");
+    await new Promise(resolve => setTimeout(resolve, 20));
+    for await (const _event of provider.streamSimple(
+      { id: "gemini-3.8-flash" },
+      { messages: [{ role: "user", content: "hi" }] },
+      { sessionId: "s-active" },
+    )) {}
+    hooks.get("model_select")!({ model: { provider: "antigravity-acp" } }, ctx);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(records.length, 2, "active connection in pool must prevent spawning redundant standby");
+
+    await hooks.get("session_shutdown")!({}, { ...ctx, sessionManager: { getSessionId: () => "s-active" } });
+  } finally {
+    await fixture.restore();
+  }
+});

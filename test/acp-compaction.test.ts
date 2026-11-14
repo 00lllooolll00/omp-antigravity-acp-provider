@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   alignContextTokens,
+  applyCompactionChunk,
   applyCompactionUpdate,
   formatCompactionNotice,
 } from "../extension/acp-compaction.ts";
@@ -107,4 +108,19 @@ test("TierConnection forwards normal ACP updates through the presentation filter
   } finally {
     await connection.close();
   }
+});
+
+test("compaction chunks bound retained summary length and terminal notices prune storage", () => {
+  let record = applyCompactionChunk(undefined, "session", { compactionId: "c-bound", content: { type: "text", text: "a".repeat(3000) } });
+  record = applyCompactionChunk(record, "session", { compactionId: "c-bound", content: { type: "text", text: "b".repeat(3000) } });
+  assert.equal(record?.summary.length, 4096);
+
+  const connection = bareConnection();
+  connection.recordCompaction("session", { compactionId: "c1", status: "in_progress", summary: [{ type: "text", text: "working" }] });
+  assert.deepEqual(connection.takeCompactionNotices(), []);
+  assert.equal(connection.compactions.get("session")?.size, 1);
+  connection.recordCompaction("session", { compactionId: "c1", status: "completed", summary: [{ type: "text", text: "done" }] });
+  const notices = connection.takeCompactionNotices();
+  assert.equal(notices.length, 1);
+  assert.equal(connection.compactions.size, 0, "terminal notified compactions must be evicted from memory");
 });

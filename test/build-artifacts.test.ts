@@ -46,3 +46,14 @@ test("built quota probe isolates session cwd outside the project directory", { s
   assert.match(text, /await connection\.newSession\(quotaCwd, signal\);/,
     "quota probe session/new must use quotaCwd so upstream runtime files are not materialized in the workspace");
 });
+
+test("built bundle lazy-loads unzipper chunk and drops non-English zod locales", { skip: !built }, async () => {
+  const text = fs.readFileSync(bundle, "utf8");
+  assert.doesNotMatch(text, /node_modules\/zod\/v4\/locales\/zh-CN\.js/);
+  assert.doesNotMatch(text, /node_modules\/unzipper\//);
+  const zipChunkPath = path.resolve("extension/assets/zip-archive.mjs");
+  assert.equal(fs.existsSync(zipChunkPath), true);
+  // Intentionally exercise the runtime lazy-import boundary of the split chunk.
+  const zipMod = await import(zipChunkPath);
+  assert.equal(typeof zipMod.Open?.file, "function");
+});

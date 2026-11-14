@@ -430,3 +430,83 @@ test("a marker removal during a fresh login does not close the new ACP runtime",
     logoutFollow.delayMs = originalDelayMs;
   }
 });
+
+test("releaseContext drops stale OMP context references after session shutdown", () => {
+  const fixture = authCoordinatorFixture();
+  let notified = 0;
+  const staleCtx = {
+    ...fixture.ctx,
+    ui: { notify: () => { notified++; } },
+  };
+  fixture.coordinator.watchOmpCredentials(staleCtx);
+  fixture.coordinator.releaseContext({ ui: { notify: () => {} } } as OmpCommandContext);
+  assert.equal((fixture.coordinator as any).activeContext, staleCtx, "mismatched context release leaves activeContext intact");
+  fixture.coordinator.releaseContext(staleCtx);
+  assert.equal((fixture.coordinator as any).activeContext, undefined, "matching context release clears activeContext");
+  fixture.coordinator.dispose();
+  assert.equal(notified, 0);
+});
+
+test("cross-process login lock prevents a second OMP instance from clearing credentials mid-login", async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-auth-lock-"));
+  const originalPresent = keychain.present;
+  const originalRemove = keychain.remove;
+  let removeCalls = 0;
+  keychain.present = async () => false;
+  keychain.remove = async () => { removeCalls++; return true; };
+  const originalDelayMs = logoutFollow.delayMs;
+  logoutFollow.delayMs = 5;
+  try {
+    const handlers = new Map<string, (event: unknown, ctx: OmpCommandContext) => unknown>();
+    let generationListener: (() => void) | undefined;
+    let stored: any = { refresh: MARKER };
+    const ctxA = {
+      ui: { notify: () => {} },
+      modelRegistry: {
+        authStorage: {
+          credentials: {
+            getOAuth: () => stored,
+            remove: async () => { stored = undefined; },
+            onGeneration: (fn: () => void) => { generationListener = fn; return () => {}; },
+          },
+        },
+      },
+    } as unknown as OmpCommandContext;
+
+    const procA = new OmpAuthCoordinator({
+      pi: { on: (name, fn) => handlers.set(name, fn) },
+      stateDir,
+      connections: new Set(),
+      isPoolBusy: () => false,
+      logoutAllRuntimes: async () => {},
+      closeAllRuntimes: async () => {},
+      onSyncProvider: () => {},
+    });
+    let procBLogouts = 0;
+    const procB = new OmpAuthCoordinator({
+      pi: { on: () => {} },
+      stateDir,
+      connections: new Set(),
+      isPoolBusy: () => false,
+      logoutAllRuntimes: async () => { procBLogouts++; },
+      closeAllRuntimes: async () => {},
+      onSyncProvider: () => {},
+    });
+
+    procB.watchOmpCredentials(ctxA);
+    await procA.beginFreshGoogleLogin();
+    // Simulate OMP removing the marker in the credential store while procA awaits browser OAuth.
+    stored = undefined;
+    generationListener?.();
+    await settle(40);
+    assert.equal(procBLogouts, 0, "second OMP process must not run followed logout while a login lock is active");
+    assert.equal(removeCalls, 0);
+
+    procA.endFreshGoogleLogin();
+  } finally {
+    keychain.present = originalPresent;
+    keychain.remove = originalRemove;
+    logoutFollow.delayMs = originalDelayMs;
+    await fs.rm(stateDir, { recursive: true, force: true });
+  }
+});

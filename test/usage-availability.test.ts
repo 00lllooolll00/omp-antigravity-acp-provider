@@ -87,3 +87,25 @@ test("initial session command lists seed usage support for new, resumed, and loa
     await connection.close();
   }
 });
+
+test("newSession retries once after a fast startup auth_required race", async () => {
+  const parent = Object.getPrototypeOf(TierConnection.prototype) as BaseConnectionMethods;
+  const original = parent.newSession;
+  let attempts = 0;
+  parent.newSession = async () => {
+    attempts++;
+    if (attempts === 1) throw new Error("Authentication required");
+    return { sessionId: "recovered-session", availableCommands: [] };
+  };
+  const connection = new TierConnection({
+    cwd: process.cwd(), command: process.execPath, args: ["-e", "setTimeout(() => {}, 1000)"], handlers: {},
+  });
+  try {
+    const session = await connection.newSession(process.cwd());
+    assert.equal(session.sessionId, "recovered-session");
+    assert.equal(attempts, 2);
+  } finally {
+    parent.newSession = original;
+    await connection.close();
+  }
+});

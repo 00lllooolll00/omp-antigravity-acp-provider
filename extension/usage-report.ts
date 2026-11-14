@@ -161,7 +161,7 @@ export function createAntigravityUsageProvider(deps: {
   providerId?: string;
   authReady: () => Promise<boolean>;
   fetchQuota: (signal?: AbortSignal) => Promise<AntigravityQuotaSnapshot>;
-  getAccountEmail: () => string | undefined;
+  getAccountEmail: () => string | undefined | Promise<string | undefined>;
 }): OmpUsageProvider {
   const providerId = deps.providerId ?? "antigravity-acp";
   return {
@@ -176,7 +176,7 @@ export function createAntigravityUsageProvider(deps: {
         const snapshot = await deps.fetchQuota(params.signal);
         return quotaSnapshotToUsageReport(snapshot, {
           provider: providerId,
-          email: deps.getAccountEmail() ?? params.credential.email,
+          email: (await deps.getAccountEmail()) ?? params.credential.email,
           accountId: params.credential.accountId,
         });
       } catch (error) {

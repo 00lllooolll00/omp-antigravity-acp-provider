@@ -47,3 +47,24 @@ test("secret service clear success reports removal", async () => {
   const service = createSecretService(async () => "", "linux");
   assert.equal(await service.remove(), true);
 });
+
+test("secret service extracts non-secret email without leaking tokens", async () => {
+  const service = createSecretService(
+    async () => JSON.stringify({ token: { refresh_token: "secret-token" }, auth_method: "oauth-personal", id_token_email: "user@example.com" }),
+    "linux",
+  );
+  assert.equal(await service.accountEmail?.(), "user@example.com");
+
+  const payload = Buffer.from(JSON.stringify({ email: "jwt-user@example.com" })).toString("base64url");
+  const jwtService = createSecretService(
+    async () => JSON.stringify({ id_token: `header.${payload}.sig` }),
+    "linux",
+  );
+  assert.equal(await jwtService.accountEmail?.(), "jwt-user@example.com");
+
+  const invalid = createSecretService(async () => "not-json", "linux");
+  assert.equal(await invalid.accountEmail?.(), undefined);
+
+  const darwin = createSecretService(async () => JSON.stringify({ id_token_email: "user@example.com" }), "darwin");
+  assert.equal(await darwin.accountEmail?.(), undefined);
+});

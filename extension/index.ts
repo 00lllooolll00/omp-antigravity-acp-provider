@@ -27,10 +27,10 @@ import { loadToolPolicy } from "./tool-policy.ts";
 import {
   MARKER,
   OmpAuthCoordinator,
-  antigravityAccountEmail,
   authReady,
   keychain,
   logoutFollow,
+  resolveAntigravityAccountEmail,
   secretService,
   type OmpCommandContext,
 } from "./auth-sync.ts";
@@ -213,14 +213,22 @@ export async function registerOmpAdapter(
     });
   }
 
+  let quotaRuntime: AntigravityRuntime | undefined;
+
   async function fetchQuotaSnapshot(signal?: AbortSignal) {
     await awaitWithAbort(prepareManagedRuntimeForQuota(), signal);
-    const lease = runtimes.acquire();
-    try {
-      return await lease.value.runtime.quota(undefined, signal);
-    } finally {
-      lease.release();
-    }
+    const runtime = (quotaRuntime ??= new AntigravityRuntime((options: ConstructorParameters<typeof TierConnection>[0]) => {
+      const connection = spawnConnection({
+        ...options,
+        ompPurpose: "quota",
+        ompCleanup: cleanup,
+        ompDiagnostics: diagnostics,
+      });
+      connections.add(connection);
+      void connection.process.exited.finally(() => { connections.delete(connection); });
+      return connection;
+    }, currentPermissionProfile().wireMode, sessionStore));
+    return await runtime.quota(undefined, signal);
   }
 
   // Inference and model discovery must not let the ACP server open an
@@ -240,7 +248,10 @@ export async function registerOmpAdapter(
     runtimeKey: string;
     controller: AbortController;
     consumed: boolean;
+    idleTimer?: NodeJS.Timeout;
   }
+  const standbyTtlRaw = process.env.OMP_ACP_STANDBY_TTL_MS;
+  const standbyTtlMs = standbyTtlRaw === undefined ? 300_000 : Number(standbyTtlRaw);
   let shuttingDown = false;
   let standby: StandbyConnection | undefined;
   let warmupInFlight: Promise<void> | undefined;
@@ -253,6 +264,8 @@ export async function registerOmpAdapter(
     const current = standby;
     standby = undefined;
     if (current && !current.consumed) {
+      clearTimeout(current.idleTimer);
+      current.idleTimer = undefined;
       current.controller.abort();
       await current.connection.close().catch(() => {});
     }
@@ -263,6 +276,7 @@ export async function registerOmpAdapter(
   // valid local auth, so non-Antigravity OMP sessions pay zero process cost.
   function scheduleWarmup(modelProvider?: string): void {
     if (!standbyWarmupEnabled || shuttingDown || modelProvider !== "antigravity-acp" || standby || warmupInFlight) return;
+    if (connections.size > 0) return;
     const generation = warmupGeneration;
     const controller = new AbortController();
     warmupController = controller;
@@ -311,7 +325,15 @@ export async function registerOmpAdapter(
         };
         standby = entry;
         published = true;
+        if (Number.isSafeInteger(standbyTtlMs) && standbyTtlMs > 0) {
+          entry.idleTimer = setTimeout(() => {
+            if (standby === entry && !entry.consumed) void closeStandby();
+          }, standbyTtlMs);
+          entry.idleTimer.unref();
+        }
         void connection.process.exited.finally(() => {
+          clearTimeout(entry.idleTimer);
+          entry.idleTimer = undefined;
           if (standby === entry && !entry.consumed) standby = undefined;
         });
       } catch {
@@ -330,7 +352,7 @@ export async function registerOmpAdapter(
   if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs < 0 || idleTimeoutMs > 2_147_483_647 || (idleTimeoutMs > 0 && idleTimeoutMs < 1000)) {
     throw new Error("OMP_ACP_IDLE_TIMEOUT_MS must be 0 (disabled) or an integer between 1000 and 2147483647");
   }
-  const maxIdleEntries = Number(process.env.OMP_ACP_MAX_IDLE_RUNTIMES ?? 2);
+  const maxIdleEntries = Number(process.env.OMP_ACP_MAX_IDLE_RUNTIMES ?? 1);
   if (!Number.isSafeInteger(maxIdleEntries) || maxIdleEntries < 0) throw new Error("OMP_ACP_MAX_IDLE_RUNTIMES must be a nonnegative integer (0 disables the cap)");
   const toolProjectionMemo = createStructuredFingerprintMemo();
   let toolRevision = 0;
@@ -372,7 +394,8 @@ export async function registerOmpAdapter(
           const entry = standby;
           standby = undefined;
           entry.consumed = true;
-          entry.connection.debugToolUpdates = Boolean(options.ompDebugToolUpdates);
+          clearTimeout(entry.idleTimer);
+          entry.idleTimer = undefined;
           entry.connection.configureUsage(options.ompUsageMode ?? DEFAULT_USAGE_MODE);
           entry.connection.rebindHandlers(options.handlers);
           diagnostics.record("warmup.hit", 0);
@@ -421,17 +444,32 @@ export async function registerOmpAdapter(
     return {
       runtime,
       provider: createAntigravityProvider(runtime).provider,
-      isBusy: () => [...ownedConnections].some(connection => connection.activePrompts > 0),
+      isBusy: () => {
+        for (const connection of ownedConnections) if (connection.activePrompts > 0) return true;
+        return false;
+      },
     };
   }, (bundle, id) => lifecycle.disposeRuntime(id, bundle, () => bundle.runtime.close()),
   { timeoutMs: idleTimeoutMs, maxIdleEntries, canDispose: bundle => !bundle.isBusy() });
 
-  async function closePool() { await closeStandby(); await lifecycle.closeAll(); await runtimes.closeAll(); }
+  async function closePool() {
+    await closeStandby();
+    const activeQuota = quotaRuntime;
+    quotaRuntime = undefined;
+    await Promise.allSettled([
+      lifecycle.closeAll(),
+      runtimes.closeAll(),
+      activeQuota ? activeQuota.close() : Promise.resolve(),
+    ]);
+    cachedToolProjection = undefined;
+    toolProjectionMemo.clear();
+  }
 
   const routing = new TranscriptRouting();
   const sessionIdOf = (ctx: OmpCommandContext | undefined): string | undefined => ctx?.sessionManager?.getSessionId?.();
   pi.on("session_shutdown", async (_event: unknown, ctx: OmpCommandContext) => {
     shuttingDown = true;
+    auth.releaseContext(ctx);
     const failures: unknown[] = [];
     const sessionId = sessionIdOf(ctx);
     if (sessionId) {
@@ -444,9 +482,14 @@ export async function registerOmpAdapter(
       await closePool();
     }
     await sessionStore.flush().catch(error => { failures.push(error); });
+    const poolEmpty = !runtimes.hasEntries();
+    if (poolEmpty) {
+      cachedToolProjection = undefined;
+      toolProjectionMemo.clear();
+    }
     await Promise.allSettled([
       cleanup.flushStoreNotes(),
-      runtimes.values().length ? Promise.resolve() : cleanup.stop(),
+      poolEmpty ? cleanup.stop() : Promise.resolve(),
     ]).then(results => {
       for (const result of results) if (result.status === "rejected") failures.push(result.reason);
     });
@@ -463,11 +506,15 @@ export async function registerOmpAdapter(
 
   const auth = new OmpAuthCoordinator({
     pi,
+    stateDir,
     connections,
     isPoolBusy: () => runtimes.values().some(bundle => bundle.isBusy()),
     logoutAllRuntimes: async () => {
       await closeStandby();
-      await Promise.all(runtimes.values().map(bundle => bundle.runtime.logout()));
+      await Promise.all([
+        ...runtimes.values().map(bundle => bundle.runtime.logout()),
+        ...(quotaRuntime ? [quotaRuntime.logout()] : []),
+      ]);
       // Finish the Antigravity-side cleanup even when the pool is empty,
       // instead of instantiating a runtime just to log it out.
       await sessionStore.clear();
@@ -507,7 +554,12 @@ export async function registerOmpAdapter(
     scheduleWarmup(activeModelProvider(event, ctx));
   });
   pi.on("model_select", (event: unknown, ctx: OmpCommandContext) => {
-    scheduleWarmup(activeModelProvider(event, ctx));
+    const provider = activeModelProvider(event, ctx);
+    if (provider && provider !== "antigravity-acp") {
+      void closeStandby();
+    } else {
+      scheduleWarmup(provider);
+    }
   });
   pi.on("agent_end", async (event: unknown, ctx: OmpCommandContext) => {
     await trackOmpSource(event, ctx);
@@ -627,7 +679,7 @@ export async function registerOmpAdapter(
         usage: createAntigravityUsageProvider({
           authReady,
           fetchQuota: fetchQuotaSnapshot,
-          getAccountEmail: antigravityAccountEmail,
+          getAccountEmail: resolveAntigravityAccountEmail,
         }),
         streamSimple(
           model: { id: string },
@@ -746,13 +798,21 @@ export async function registerOmpAdapter(
               auth.noteLoginSucceeded();
               // Record the signed-in account on the marker credential so OMP's
               // account list can label it; the email is identity data, not a secret.
-              const email = antigravityAccountEmail();
+              const email = await resolveAntigravityAccountEmail();
               return email ? { ...result, email } : result;
             } finally {
               lease.release();
+              auth.endFreshGoogleLogin();
             }
           },
-          refreshToken: (credentials: unknown) => runtimes.get().provider.auth.oauth.refresh(credentials),
+          refreshToken: async (credentials: unknown) => {
+            const leased = runtimes.acquireExisting() ?? runtimes.acquire();
+            try {
+              return await leased.value.provider.auth.oauth.refresh(credentials);
+            } finally {
+              leased.release();
+            }
+          },
           getApiKey: () => MARKER,
         },
       });

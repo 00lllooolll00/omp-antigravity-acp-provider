@@ -1,5 +1,5 @@
 import { describeCredentialStorage, savePermissionMode } from "./runtime.mjs";
-import { antigravityAccountEmail, formatLogoutSummary, inspectAcpAuth, keychain, ompCredentialSummary, type OmpAuthCoordinator, type OmpCommandContext } from "./auth-sync.ts";
+import { formatLogoutSummary, inspectAcpAuth, keychain, ompCredentialSummary, resolveAntigravityAccountEmail, type OmpAuthCoordinator, type OmpCommandContext } from "./auth-sync.ts";
 import { parseNativeToolMode, type NativeToolMode } from "./tool-routing.ts";
 import { saveToolPolicy, type ToolPolicy } from "./tool-policy.ts";
 import { DEFAULT_USAGE_MODE, updateContextSettings, resolveContextOptions, saveContextSettings, type ContextSettings } from "./context-settings.ts";
@@ -496,12 +496,13 @@ export function createAntigravityCommandHandler(deps: CommandControllerDeps) {
             return answer;
           },
         });
+        deps.auth.noteLoginSucceeded?.();
       } finally {
         lease.release();
+        deps.auth.endFreshGoogleLogin?.();
       }
-      deps.auth.noteLoginSucceeded?.();
       const auth = await inspectAcpAuth();
-      const email = antigravityAccountEmail();
+      const email = await resolveAntigravityAccountEmail();
       ctx.ui.notify(`Antigravity Google login finished${email ? ` as ${email}` : ""} — fresh sign-in; ACP auth: ${auth.status}${auth.authType ? ` (${auth.authType})` : ""}.`, "info");
       return;
     }
@@ -525,7 +526,7 @@ export function createAntigravityCommandHandler(deps: CommandControllerDeps) {
       const snapshot = await bundle?.runtime.snapshot();
       const permissionMode = deps.getPermissionMode();
       const omp = ompCredentialSummary(ctx);
-      const accountEmail = antigravityAccountEmail();
+      const accountEmail = await resolveAntigravityAccountEmail();
       const marker = omp.present === undefined ? "unknown; host did not expose the credential store"
         : omp.present ? `present · ${omp.record} · authorized ${omp.authorizedAt ?? "unknown time"}${omp.email && omp.email !== accountEmail ? ` · account ${omp.email}` : ""}`
         : "not stored; run /login or /antigravity-acp login";

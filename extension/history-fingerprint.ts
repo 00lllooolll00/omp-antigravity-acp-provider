@@ -7,6 +7,10 @@ const MIN_STRING = 2048;
 const MAX_NODES = 128;
 type Snapshot = { value: unknown; digest: string };
 
+export function isSupportedSnapshot(value: unknown): boolean {
+  return value !== UNSUPPORTED;
+}
+
 function worthCaching(content: unknown): boolean {
   if (typeof content === "string") return content.length >= MIN_STRING;
   if (!Array.isArray(content) || types.isProxy(content)) return false;
@@ -23,7 +27,7 @@ function worthCaching(content: unknown): boolean {
 
 // Snapshot construction never retains a live mutable container or invokes an
 // accessor. Reject exotic prototypes, aliases/cycles and sparse/custom arrays.
-function snapshot(value: any, budget = { nodes: 0 }, seen = new Set<object>()): any {
+export function valueSnapshot(value: any, budget = { nodes: 0 }, seen = new Set<object>()): any {
   if (++budget.nodes > MAX_NODES) return UNSUPPORTED;
   if (value === null || typeof value !== "object") {
     return ["function", "symbol", "bigint"].includes(typeof value) ? UNSUPPORTED : value;
@@ -40,14 +44,14 @@ function snapshot(value: any, budget = { nodes: 0 }, seen = new Set<object>()): 
     if (array && key !== String(i)) return UNSUPPORTED;
     const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
     if (!Object.hasOwn(descriptor, "value")) return UNSUPPORTED;
-    const child = snapshot(descriptor.value, budget, seen);
+    const child = valueSnapshot(descriptor.value, budget, seen);
     if (child === UNSUPPORTED) return UNSUPPORTED;
     result[key] = child;
   }
   return result;
 }
 
-function matches(value: any, saved: any, budget = { nodes: 0 }): boolean {
+export function valueMatches(value: any, saved: any, budget = { nodes: 0 }): boolean {
   if (++budget.nodes > MAX_NODES) return false;
   if (value === null || typeof value !== "object") return Object.is(value, saved);
   const array = Array.isArray(value);
@@ -59,7 +63,7 @@ function matches(value: any, saved: any, budget = { nodes: 0 }): boolean {
   for (const key of keys) {
     const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
     if (!Object.hasOwn(descriptor, "value") || !Object.hasOwn(saved, key) ||
-        !matches(descriptor.value, saved[key], budget)) return false;
+        !valueMatches(descriptor.value, saved[key], budget)) return false;
   }
   return true;
 }
@@ -68,11 +72,11 @@ export function createHistoryFingerprintMemo() {
   const entries = new WeakMap<object, Snapshot>();
   return (message: object, value: any, compute: () => string): string => {
     const previous = entries.get(message);
-    if (previous && matches(value, previous.value)) return previous.digest;
+    if (previous && valueMatches(value, previous.value)) return previous.digest;
     // Drop stale strings even if canonical serialization subsequently throws.
     if (previous) entries.delete(message);
     if (!worthCaching(value.content)) return compute();
-    const saved = snapshot(value);
+    const saved = valueSnapshot(value);
     const digest = compute();
     if (saved !== UNSUPPORTED) entries.set(message, { value: saved, digest });
     return digest;
