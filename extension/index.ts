@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { applyApiCostEstimate } from "./pricing.ts";
+import { ensureLoopbackBypass } from "./proxy-env.ts";
 import {
   assertSelectedAcpCliLaunch,
   preferNewestAcpRuntime,
@@ -384,11 +385,11 @@ export async function registerOmpAdapter(
         if (warmupInFlight) void closeStandby();
       }
     }
-    const env = {
+    const env = ensureLoopbackBypass({
       ...process.env,
       ...options.env,
       OMP_ACP_DANGEROUSLY_SKIP_PERMISSIONS: profile.autoApproveProcess ? "1" : "",
-    };
+    });
     const launch = options.command || options.entryPath ? undefined
       : assertSelectedAcpCliLaunch(stateDir, selectedRuntimePreference, env, options.ompPurpose === "quota" ? "quota" : "inference");
     return makeConnection({ ...options, ...launch, env });
