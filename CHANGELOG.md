@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.0 — 2026-11-14
+
+- 隔离 `agy acp` 全局 MCP 配置：通过 `--gemini-dir` 配合 `antigravity-acp` 软链接默认隔离 `~/.gemini/config/mcp_config.json`（保留 `OMP_ACP_INCLUDE_DEFAULT_CUSTOMIZATIONS=1` 还原开关），避免多开重复 MCP 进程，同时完整保留凭据、会话与清理路径；并在 `TOOL_ROUTING` 补充 `xd://mcp__*` 经由 `pi_read` / `pi_write` 的调用指引。
+- 同步上游 `v0.2.2` 核心改进：新增统一适配器配置模块（`extension/adapter-config.ts`），默认权限模式改为 `follow`（自动跟随 OMP `tools.approvalMode` 及 CLI `--approval-mode` / `--auto-approve`）；新增 `:side:` shadow 会话路由隔离（`extension/routing.ts`）；新增 Claude Sonnet/Opus 5.5、Claude 4.6、GPT-OSS-120b 离线目录元数据与 API-equivalent 费率表；强化 `pi-bridge` 工具名投影、OAuth `/AccountChooser` / `/signin/oauth` URL 解析与锁释放安全（`releaseAfter`）。
+
 ## 0.1.52 — 2026-11-14
 
 - 优化内存与启动体积：裁剪 `zod` 非英文 locale、将 `unzipper` 拆分为按需加载的 `extension/assets/zip-archive.mjs`（`extension/runtime.mjs` 从 2.50 MB 降至 1.79 MB，加载堆占用降低约 1.85 MB），并修复 `bounded-stream.ts` 大帧分片 $O(N^2)$ 拷贝。
